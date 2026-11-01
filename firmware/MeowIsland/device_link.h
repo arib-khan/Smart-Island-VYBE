@@ -31,6 +31,11 @@ static volatile uint16_t bleDirty = 0;               // bit n = bleSlot[n] holds
 constexpr uint8_t IMGQ_N = 20;
 static meow::Frame imgQ[IMGQ_N];
 static volatile uint8_t imgQHead = 0, imgQTail = 0;
+// The phone-rendered lyric mask also arrives as a burst of chunks that must all be handled. It has its own small queue so a big
+// image transfer cannot make the lyrics stutter (and vice versa).
+constexpr uint8_t LYRQ_N = 16;
+static meow::Frame lyrQ[LYRQ_N];
+static volatile uint8_t lyrQHead = 0, lyrQTail = 0;
 static meow::FrameAssembler bleAssembler;            // touched only by the BLE task
 
 static volatile bool bleLinked = false;              // a phone is connected
@@ -52,7 +57,7 @@ static volatile bool bleRejectPairing = false;       // pairing was attempted wh
 class MeowServerCb : public NimBLEServerCallbacks {
  public:
   void onConnect(NimBLEServer*, NimBLEConnInfo& info) override { bleConn = info.getConnHandle(); bleLinked = true; bleSecure = false; bleAssembler.reset(); bleLinkedAt = millis(); blePairingActive = false; bleRejectPairing = false; }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override { bleLinked = false; bleSecure = false; bleAssembler.reset(); bleAdvDirty = true; blePairingActive = false; bleRejectPairing = false; bleConn = 0xFFFF; }
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override { bleLinked = false; bleSecure = false; bleAssembler.reset(); bleAdvDirty = true; blePairingActive = false; bleRejectPairing = false; bleConn = 0xFFFF; imgQTail = imgQHead; lyrQTail = lyrQHead; }
   uint32_t onPassKeyDisplay() override {
     uint32_t code = 100000 + (esp_random() % 900000);
     if (blePairingOpen) { blePasskey = code; blePasskeyReady = true; blePairingActive = true; bleLinkedAt = millis(); }   // shown on the TFT by the main loop
@@ -76,7 +81,8 @@ class MeowRxCb : public NimBLECharacteristicCallbacks {
     for (size_t i = 0; i < n; i++) {
       if (bleAssembler.push(d[i], millis(), f) && f.type >= 1 && f.type <= meow::MSG_LAST) {
         portENTER_CRITICAL(&bleMux);
-        if (f.type >= meow::MSG_IMG_BEGIN) { uint8_t nx = (uint8_t)((imgQHead + 1) % IMGQ_N); if (nx != imgQTail) { imgQ[imgQHead] = f; imgQHead = nx; } }
+        if (f.type == meow::MSG_LYRIC) { uint8_t nx = (uint8_t)((lyrQHead + 1) % LYRQ_N); if (nx != lyrQTail) { lyrQ[lyrQHead] = f; lyrQHead = nx; } }
+        else if (f.type >= meow::MSG_IMG_BEGIN && f.type < meow::MSG_LYRIC) { uint8_t nx = (uint8_t)((imgQHead + 1) % IMGQ_N); if (nx != imgQTail) { imgQ[imgQHead] = f; imgQHead = nx; } }
         else { bleSlot[f.type] = f; bleDirty |= (uint16_t)(1u << f.type); }
         portEXIT_CRITICAL(&bleMux);
       }
@@ -103,6 +109,15 @@ static bool bleTakeImg(meow::Frame& out) {
   return got;
 }
 static void bleFlushImg() { portENTER_CRITICAL(&bleMux); imgQTail = imgQHead; portEXIT_CRITICAL(&bleMux); }
+// Pops the oldest queued lyric chunk, if any.
+static bool bleTakeLyric(meow::Frame& out) {
+  bool got = false;
+  portENTER_CRITICAL(&bleMux);
+  if (lyrQTail != lyrQHead) { out = lyrQ[lyrQTail]; lyrQTail = (uint8_t)((lyrQTail + 1) % LYRQ_N); got = true; }
+  portEXIT_CRITICAL(&bleMux);
+  return got;
+}
+static void bleFlushLyric() { portENTER_CRITICAL(&bleMux); lyrQTail = lyrQHead; portEXIT_CRITICAL(&bleMux); }
 static bool bleTakePasskey(uint32_t& code) { if (!blePasskeyReady) return false; code = blePasskey; blePasskeyReady = false; return true; }
 static int  bleBonds() { return NimBLEDevice::getNumBonds(); }
 

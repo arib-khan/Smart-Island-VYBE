@@ -19,6 +19,7 @@ constexpr uint32_t RX_TIMEOUT_MS = 6000;
 struct RxSink {
   virtual ~RxSink() {}
   virtual uint32_t storedCustomCrc() = 0;                                          // CRC-32 of the stored custom file, 0 when there is none
+  virtual uint32_t storedArtCrc() = 0;                                             // CRC-32 of the album art in RAM, 0 when there is none
   virtual bool open(uint8_t kind, uint32_t total, uint16_t w, uint16_t h, uint8_t& reason) = 0;   // prepare storage (temp file / RAM block)
   virtual bool write(uint8_t kind, const uint8_t* d, size_t n) = 0;
   virtual bool commit(uint8_t kind, uint32_t crc, uint8_t& reason) = 0;            // validate + publish; false keeps the old content
@@ -73,7 +74,7 @@ class ImageReceiver {
 
   void service(uint32_t now) { if (state_ == XFER_RECEIVING && (uint32_t)(now - last_) > RX_TIMEOUT_MS) fail(XR_SEQUENCE); }
 
-  XferStatus status() const { XferStatus s; s.state = state_; s.id = id_; s.reason = reason_; s.nextSeq = next_; s.customCrc = sink_->storedCustomCrc(); return s; }
+  XferStatus status() const { XferStatus s; s.state = state_; s.id = id_; s.reason = reason_; s.nextSeq = next_; s.customCrc = sink_->storedCustomCrc(); s.artCrc = sink_->storedArtCrc(); return s; }
   uint8_t state() const { return state_; }
   uint8_t kind() const { return kind_; }
 

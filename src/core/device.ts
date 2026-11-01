@@ -63,7 +63,7 @@ export function wifiText(d: DeviceState): string {
 export const SCREENS = [
   { id: 0, name: 'Clock', icon: '🕒', hint: 'The neon sleeping-cat clock. Always available.' },
   { id: 1, name: 'Steps', icon: '👟', hint: 'Today’s steps, goal and heat-map from your Health tab.' },
-  { id: 2, name: 'Music', icon: '🎵', hint: 'What is playing on this phone: album art, title, progress and, for Spotify, synced lyrics when a lyrics source is on.' },
+  { id: 2, name: 'Music', icon: '🎵', hint: 'What is playing on this phone: album art, title, progress and lyrics from any music app when online lyrics is on. YouTube shows only its thumbnail, title and progress.' },
   { id: 3, name: 'Screen time', icon: '📱', hint: 'How long this PHONE has been used today, your daily goal and the most-used apps.' },
   { id: 4, name: 'Notifications', icon: '🔔', hint: 'The newest notifications from this phone (needs Notification Access and the switch below).' },
   { id: 5, name: 'Custom', icon: '🎨', hint: 'Your own HTML design, rendered on the phone and stored on the device.' },

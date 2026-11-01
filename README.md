@@ -36,6 +36,9 @@ The goal is simple: make a compact, customizable island that can surface music c
 | **Customizable floating island** | Show a compact pill above other apps; adjust position and size, with saved settings | Implemented in source; device testing pending |
 | **Drag-to-position editor** | Move the island, use position controls/presets, and reset its location | Implemented in source; device testing pending |
 | **Music controls** | Show media information and artwork; control previous, play/pause, and next when supported by the active media session | Implemented in source; player/device testing pending |
+| **Universal music detection** | One provider-independent model for any app that publishes an Android media session (Spotify, Amazon Music, Apple Music, Tidal, Deezer, local players, YouTube) | Implemented in source; multi-provider testing pending |
+| **Lyrics & cached artwork** | Opt-in LRCLIB → lyrics.ovh fallback, version-aware matching, synced or plain lyrics, phone-rendered multilingual/RTL lyric mask, persistent album-art cache and an art CRC that skips repeat transfers | Implemented in source; provider/device testing pending |
+| **YouTube display** | Thumbnail, title, duration and a bottom progress bar; no caption or lyrics extraction | Implemented in source; device testing pending |
 | **Animated music artwork** | Rotate artwork while playback is active and stop when playback pauses | Implemented in source; device testing pending |
 | **Screen Time Guardian** | Choose installed apps, configure daily limits, and show cat reactions when a limit is exceeded or when you leave the app | Implemented in source; usage-access testing pending |
 | **Repeat limit reminders** | Remind you at a configurable interval (default: five minutes) while an app remains over its limit | Implemented in source; timing/foreground-service testing pending |
@@ -154,6 +157,8 @@ Meow Island is in an early development stage, and the following limitations are 
 - **Screen-time updates can be delayed.** Android usage events may arrive in batches. Reminder timing is not guaranteed to be exact.
 - **Background behavior varies by device.** Battery optimization and manufacturer-specific task management may stop the island service. Force-stopping the app or revoking permissions also affects behavior.
 - **Timers are basic.** Pause/resume controls are not implemented in the current version.
+- **Lyrics depend on public databases.** LRCLIB and lyrics.ovh do not cover every song, language or version; lyrics.ovh is plain-text only and cannot verify versions, so version-marked titles are deliberately not sent to it. Video apps (YouTube and streaming video) never get lyrics.
+- **Artwork crosses Bluetooth.** Cached covers and covers the display already holds appear immediately; the first transfer of a new 80x80 cover is bounded by the BLE link. The display keeps one cover in RAM, not a multi-cover cache.
 - **Design scope is still evolving.** The current interface is dark-theme focused; some polish and setup flows may remain incomplete.
 - **An APK is not provided by this README.** Build it locally using the setup guide, and verify the resulting build before installing or sharing it.
 

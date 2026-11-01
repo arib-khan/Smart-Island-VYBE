@@ -145,11 +145,19 @@ static void handleFrames(uint32_t now) {
       if (strcmp(d.title, musicView.d.title) != 0 || strcmp(d.artist, musicView.d.artist) != 0) {      // a new track: lyric lines and art of the previous one must not linger
         char keep[sizeof musicView.d2.src]; memcpy(keep, musicView.d2.src, sizeof keep);
         musicView.d2 = meow::Music2Data(); memcpy(musicView.d2.src, keep, sizeof keep);
+        lyrClear();
       }
       musicView.d = d; musicView.haveData = true; musicView.rxAt = now;
     }
   }
   if (bleTake(meow::MSG_MUSIC2, f)) { meow::Music2Data d; if (meow::parseMusic2(f.payload, f.len, d)) { musicView.d2 = d; musicView.haveData2 = true; } }
+  // phone-rendered lyric mask chunks (queued in order; a burst may span several loop iterations)
+  { meow::Frame lf; int guard = 0;
+    while (guard++ < 24 && bleTakeLyric(lf)) {
+      if (meow::isLyricClear(lf.payload, lf.len)) lyrClear();
+      else { meow::LyricChunk c; if (meow::parseLyricChunk(lf.payload, lf.len, c)) lyrOnChunk(c, now); }
+    }
+  }
   if (bleTake(meow::MSG_SCREENTIME, f)) {
     meow::ScreenTimeData d;
     if (meow::parseScreenTime(f.payload, f.len, d)) { stView.d = d; stView.haveData = true; stView.rxAt = now; if (curScreen == meow::SCREEN_SCREENTIME && overlay == OV_NONE) { stView.linked = bleSecure; screenTimeRender(stView); } }
@@ -241,6 +249,7 @@ void loop() {
   bleService(now, st, imgRx.status());
   handleFrames(now);
   imgRx.service(now);
+  lyrService(now);
 
   // pairing passkey: shown for as long as the phone is still pairing
   uint32_t code;
@@ -251,7 +260,7 @@ void loop() {
   static bool lastSecure = false;
   if (lastSecure != bleSecure) {
     lastSecure = bleSecure; stepsView.linked = bleSecure; stView.linked = bleSecure; ntView.linked = bleSecure; cuView.linked = bleSecure;
-    if (!bleSecure) { if (imgRx.state() == meow::XFER_RECEIVING) imgRx.onCtrl(meow::CTRL_ABORT); bleFlushImg(); }   // a half-sent image is dropped, the stored one stays
+    if (!bleSecure) { if (imgRx.state() == meow::XFER_RECEIVING) imgRx.onCtrl(meow::CTRL_ABORT); bleFlushImg(); bleFlushLyric(); lyrClear(); }   // a half-sent image is dropped, the stored one stays
     if (overlay == OV_NONE) {
       if (curScreen == meow::SCREEN_STEPS) stepsRender(stepsView);
       else if (curScreen == meow::SCREEN_SCREENTIME) screenTimeRender(stView);

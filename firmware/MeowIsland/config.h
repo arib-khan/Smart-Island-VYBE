@@ -43,7 +43,7 @@ constexpr uint32_t SPI_HZ        = 40000000; // lower to 20000000 if you see gli
 constexpr uint32_t PAIRING_WINDOW_MS = 120000;   // how long a new phone may pair after the button hold (a device with no phone paired is always open)
 constexpr uint32_t PASSKEY_SHOW_MS   = 90000;    // the 6-digit code stays on screen this long
 constexpr uint32_t STEPS_STALE_MS    = 600000;   // steps older than this (phone gone) get a note
-constexpr uint8_t  FW_MAJOR = 1, FW_MINOR = 1;
+constexpr uint8_t  FW_MAJOR = 1, FW_MINOR = 2;   // 1.2: album-art CRC in the status, lyric mask (MSG_LYRIC), video mode
 
 constexpr uint16_t RGB(uint8_t r, uint8_t g, uint8_t b) {
   return SWAP_RED_BLUE

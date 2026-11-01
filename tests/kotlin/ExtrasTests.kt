@@ -1,10 +1,20 @@
 import com.smartisland.app.DeviceProtocol as P
 import com.smartisland.app.ImageSender
 import com.smartisland.app.Lrc
+import com.smartisland.app.LyricsMatcher
+import com.smartisland.app.LyricsProvider
+import com.smartisland.app.LyricsQuery
+import com.smartisland.app.LyricsResult
+import com.smartisland.app.LyricsService
+import com.smartisland.app.NowPlaying
+import com.smartisland.app.PlainLyrics
+import com.smartisland.app.PlainPager
+import com.smartisland.app.Provider
 import java.io.ByteArrayOutputStream
 import java.util.Random
 
-// Called from DeviceProtocolTest.kt's main(): LRC parsing and the image sender against a simulated lossy device.
+// Called from DeviceProtocolTest.kt's main(): LRC parsing, multilingual lyric matching, provider fallback and the image sender
+// against a simulated lossy device.
 
 private fun u32(f: ByteArray, at: Int): Long = (f[at].toLong() and 0xFF) or ((f[at + 1].toLong() and 0xFF) shl 8) or ((f[at + 2].toLong() and 0xFF) shl 16) or ((f[at + 3].toLong() and 0xFF) shl 24)
 private fun u16(f: ByteArray, at: Int): Int = (f[at].toInt() and 0xFF) or ((f[at + 1].toInt() and 0xFF) shl 8)
@@ -93,4 +103,57 @@ fun extrasTests() {
     }
     run { var lost = false; val s = ImageSender(2, P.KIND_ART, ByteArray(100), 80, 80, { }, { ok, _, msg -> lost = !ok && msg.contains("connection")}); s.start(0); s.linkLost(); check(lost && s.done, "sender: link loss ends the transfer with an explanation") }
     run { val dev = SimDevice(); val r = runTransfer(ByteArray(80 * 80 * 2) { it.toByte() }, P.KIND_ART, dev, 0.2, 0.1, 8); check(r.ok == true && dev.storedCrc == 0L, "sender: album art transfers and does not touch the stored custom design") }
+
+    // ---- provider-independent model ----
+    check(Provider.isVideo("com.google.android.youtube") && Provider.isVideo("com.google.android.apps.youtube.music") && !Provider.isVideo("com.amazon.mp3"), "video apps are excluded from lyrics, music apps are not")
+    check(Provider.sourceLabel("com.amazon.mp3") == "AMAZON MUSIC" && Provider.sourceLabel("com.spotify.music") == "SPOTIFY" && Provider.sourceLabel("com.example.player", "My Player") == "MY PLAYER", "provider labels")
+    val np = NowPlaying(title = "Song", durationMs = 100_000, positionMs = 90_000, positionAt = 1000, playing = true)
+    check(np.positionNow(15_000) == 100_000L && np.active && np.lyricsEligible, "position is clamped to the track length")
+    check(NowPlaying(pkg = "com.google.android.apps.youtube.music", title = "Video").lyricsEligible.not(), "YouTube Music never gets lyrics")
+    check(Provider.cacheKey("p", "", "Song  Name", "A", "B") == Provider.cacheKey("p", "", "song name", "a", "b") && Provider.cacheKey("p", "id1", "Song", "A", "B") != Provider.cacheKey("p", "id2", "Song", "A", "B"), "art/lyrics keys are stable but include the player's track id")
+
+    // ---- plain lyrics, multilingual and RTL ----
+    val plain = PlainLyrics.split("<p>[Verse 1]</p><p>Pehli line &amp; second</p><br>[Jungkook]<br>[version romanisée]<br>कभी कभी अदिति<br>میرے دل میں<br>사랑해요<br>愛してる")
+    check(plain.size == 5 && plain[0] == "Pehli line & second", "plain lyrics: tags and section labels removed, entities decoded")
+    check(plain[1] == "कभी कभी अदिति" && plain[2] == "میرے دل میں" && plain[3] == "사랑해요" && plain[4] == "愛してる", "plain lyrics: Devanagari, Urdu, Korean and Japanese pass through unchanged")
+    check(PlainLyrics.split("just one line") == emptyList<String>(), "a single fragment is not treated as lyrics")
+    val page = PlainPager.at(listOf("one", "two", "three", "four"), 0)
+    check(page.idx == 0 && page.prev == "" && page.cur == "one" && page.next == "two", "plain pager starts at the first line")
+    val page2 = PlainPager.at(listOf("one", "two", "three", "four"), 12_500)
+    check(page2.idx == 2 && page2.prev == "two" && page2.cur == "three" && page2.next == "four", "plain pager advances one line every six seconds")
+    check(PlainPager.at(listOf("one"), 99_000).idx == 0 && PlainPager.at(emptyList(), 5000).cur == "", "plain pager clamps to the text")
+
+    // ---- accurate matching: title/artist/album/length + version markers ----
+    fun q(title: String, artist: String = "Arijit Singh", album: String = "", dur: Int = 240) = LyricsQuery(title, artist, album, dur)
+    fun c(title: String, artist: String = "Arijit Singh", album: String = "", dur: Int = 240, synced: String = "[00:01.00]a\n[00:02.00]b", plain: String = "") =
+        LyricsMatcher.Candidate(title, artist, album, dur, synced, plain)
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho"))) != null, "exact title and artist matches")
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho (Live)", artist = "Arijit Singh"))) == null, "a live version is not accepted for the studio track")
+    check(LyricsMatcher.pick(q("Tum Hi Ho (Live)"), listOf(c("Tum Hi Ho"))) == null, "the studio take is not accepted for a live track")
+    check(LyricsMatcher.pick(q("Tum Hi Ho (Live)"), listOf(c("Tum Hi Ho (Live)"))) != null, "the matching live version is accepted")
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho (Remastered 2011)"))) != null, "a remaster is not a different lyric version")
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho", artist = "Some Cover Band"))) == null, "a cover by another artist is rejected")
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho", dur = 400))) == null, "a two-minute-longer recording is not the same version")
+    check(LyricsMatcher.pick(q("Tum Hi Ho"), listOf(c("Tum Hi Ho", dur = 250))) != null, "a near-identical length is accepted")
+    check(LyricsMatcher.pick(q("Kesariya", artist = "Arijit Singh", dur = 268), listOf(c("Kesariya", "Arijit Singh", "Brahmastra", 268, synced = ""), c("Kesariya", "Arijit Singh", "Brahmastra", 268)))?.synced?.isNotEmpty() == true, "the synced candidate wins over a plain one")
+    check(LyricsMatcher.versionCompatible("Song", "Song (Live)").not() && LyricsMatcher.versionCompatible("Song (Live)", "Song").not() && LyricsMatcher.versionCompatible("Song (Live)", "Song (Live at Wembley)"), "version compatibility is symmetric")
+    check(LyricsMatcher.fold("कभी कभी") == "कभी कभी" && LyricsMatcher.fold("میرے دل") == "میرے دل", "text folding keeps Devanagari matras and Arabic letters")
+    check(LyricsMatcher.similarity("사랑해요", "사랑해요") == 1.0 && LyricsMatcher.similarity("愛してる", "愛してる") == 1.0, "CJK titles compare exactly")
+
+    // ---- provider fallback ----
+    class Fake(override val name: String, override val supportsSynced: Boolean, private val r: LyricsResult, private val calls: MutableList<String>? = null) : LyricsProvider {
+        override fun fetch(query: LyricsQuery): LyricsResult { calls?.add(name); return r }
+    }
+    val calls = ArrayList<String>()
+    val offline = Fake("a", true, LyricsResult(P.LY_OFFLINE, detail = "no network"), calls)
+    val plainOnly = Fake("b", false, LyricsResult(P.LY_UNSYNCED, plain = listOf("one", "two"), provider = "b"), calls)
+    val synced = Fake("c", true, LyricsResult(P.LY_AVAILABLE, synced = Lrc.parse("[00:01.00]a\n[00:02.00]b"), provider = "c"), calls)
+    val r1 = LyricsService(listOf(offline, plainOnly)).fetch(q("Song"))
+    check(r1.state == P.LY_UNSYNCED && r1.plain.size == 2 && calls == listOf("a", "b"), "a network failure falls through to the plain provider")
+    val r2 = LyricsService(listOf(offline, synced)).fetch(q("Song"))
+    check(r2.state == P.LY_AVAILABLE && r2.synced.size == 2, "a later synced provider wins")
+    val r3 = LyricsService(listOf(Fake("x", true, LyricsResult(P.LY_UNAVAILABLE, detail = "none")), Fake("y", true, LyricsResult(P.LY_UNAVAILABLE, detail = "none")))).fetch(q("Song"))
+    check(r3.state == P.LY_UNAVAILABLE, "two 'not found' answers are UNAVAILABLE, never OFFLINE")
+    val r4 = LyricsService(listOf(Fake("x", true, LyricsResult(P.LY_OFFLINE)), Fake("y", true, LyricsResult(P.LY_OFFLINE)))).fetch(q("Song"))
+    check(r4.state == P.LY_OFFLINE, "no source reachable is OFFLINE")
 }

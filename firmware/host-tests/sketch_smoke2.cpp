@@ -62,17 +62,45 @@ int main(int, char** argv) {
   { Bytes p = {2, 0}; write(frame(meow::MSG_NOTIFS, p)); run(100); } snap("nt_access");
   { Bytes p = {1, 0}; write(frame(meow::MSG_NOTIFS, p)); run(100); } snap("nt_empty");
 
-  // ---- music extras + art
+  // ---- music extras + art ----
+  auto music2 = [&](uint8_t flags, uint8_t ly, uint16_t idx, const char* src, const char* prev, const char* cur, const char* next) {
+    Bytes b = {flags, ly}; le16(b, idx); str(b, src); str(b, prev); str(b, cur); str(b, next);
+    write(frame(meow::MSG_MUSIC2, b)); run(60);
+  };
+  auto sendBand = [&](uint8_t token, uint16_t line, uint8_t fill) {
+    Bytes mask(meow::LYR_BYTES, fill);
+    for (size_t off = 0; off < mask.size(); off += meow::LYR_CHUNK) {
+      uint16_t seq = (uint16_t)(off / meow::LYR_CHUNK);
+      Bytes p = {token, (uint8_t)seq}; le16(p, line); le16(p, meow::LYR_W); le16(p, meow::LYR_H);
+      size_t n = std::min<size_t>(meow::LYR_CHUNK, mask.size() - off); p.insert(p.end(), mask.begin() + off, mask.begin() + off + n);
+      write(frame(meow::MSG_LYRIC, p)); run(20);
+    }
+    run(250);
+  };
   { Bytes m = {3}; le16(m, 102); le16(m, 318); str(m, "Kabhi Kabhi Aditi"); str(m, "Rashid Ali"); write(frame(meow::MSG_MUSIC, m)); run(60); }
-  { Bytes p = {2, 2}; le16(p, 3); str(p, "SPOTIFY"); str(p, "previous line of the song"); str(p, "the current line is quite a bit longer than the screen"); str(p, "next line"); write(frame(meow::MSG_MUSIC2, p)); run(60); }
+  music2(2, 2, 3, "SPOTIFY", "previous line of the song", "the current line is quite a bit longer than the screen", "next line");
   selectScreen(2); run(400); CHECK(musicView.haveData2 && isSpotify(musicView), "music extras stored"); snap("music_lyrics_noart");
+  // phone-rendered mask: all bits set, so the lyric zone pixels must be the lyric colours
+  sendBand(9, 3, 0xFF);
+  CHECK(lyrReady && lyrValid(3), "lyric mask received and tied to the current line"); snap("music_lyrics_mask");
+  CHECK(px(12, 240) == C_MUTE && px(12, 260) == C_TEXT && px(12, 306) == C_MUTE, "lyric mask pixels drawn in the lyric zone");
   Bytes art(80 * 80 * 2); for (int i = 0; i < 80 * 80; i++) { art[i * 2] = 0x1F; art[i * 2 + 1] = 0xF8 & 0; }   // pure blue (0x001F) pixels
   sendImage(art, 1, meow::KIND_ART, 80, 80); CHECK(xs().state == meow::XFER_DONE && artReady && artW == 80, "album art received into RAM");
+  CHECK(xs().artCrc == meow::crc32Of(art.data(), art.size()), "the status carries the album-art CRC so a replay can skip the transfer");
   { Bytes p = {3, 2}; le16(p, 3); str(p, "SPOTIFY"); str(p, "previous line of the song"); str(p, "the current line is quite a bit longer than the screen"); str(p, "next line"); write(frame(meow::MSG_MUSIC2, p)); run(300); }
   CHECK(px(120, 80) == 0x001F, "album art pixels are on the TFT"); snap("music_lyrics_art");
-  { Bytes p = {1, 3}; le16(p, 0); str(p, "YOUTUBE"); str(p, ""); str(p, ""); str(p, ""); write(frame(meow::MSG_MUSIC2, p)); run(300); } snap("music_captions_unavailable");
-  { Bytes p = {0, 4}; le16(p, 0); str(p, "SPOTIFY"); str(p, ""); str(p, ""); str(p, ""); write(frame(meow::MSG_MUSIC2, p)); run(300); } snap("music_lyrics_off");
+  // video: no lyric zone, thumbnail/title/progress, bottom bar
+  { Bytes m = {3}; le16(m, 102); le16(m, 318); str(m, "A YouTube video title"); str(m, "A channel"); write(frame(meow::MSG_MUSIC, m)); run(80); }
+  music2(4, 0, 0, "YOUTUBE", "", "", ""); selectScreen(2); run(500);
+  CHECK(musicVideo(musicView) && musicView.d2.video && musicView.d2.lyricState == 0, "YouTube is a video: no lyrics state");
+  CHECK(px(30, 302) != C_BG, "video progress bar is at the bottom of the screen"); snap("music_video");
+  // switching back to a music source clears the video flag and asks for the lyric mask of the new line
+  music2(2, 2, 4, "AMAZON MUSIC", "prev", "current", "next");
+  sendBand(10, 4, 0xFF); run(300);
+  CHECK(!musicVideo(musicView) && lyrValid(4), "Amazon Music gets lyrics again");
+  // a new track clears the old lyric mask and art flag
   { Bytes m = {3}; le16(m, 5); le16(m, 200); str(m, "Another Song"); str(m, "Someone"); write(frame(meow::MSG_MUSIC, m)); run(300); CHECK(musicView.d2.lyricState == 0 && !musicView.d2.hasArt && !musicView.d2.cur[0], "a new track clears the old lyric lines and art flag"); }
+  CHECK(!lyrReady, "a new track clears the old lyric mask");
 
   // ---- custom screen: BOOT skips it while empty
   CHECK(customCrc == 0, "no custom image yet"); selectScreen(meow::SCREEN_MUSIC);

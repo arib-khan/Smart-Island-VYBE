@@ -1,7 +1,9 @@
 # Meow Island display firmware (ESP32 + ST7789)
 
-Three screens on the 2.8" 240×320 TFT: the neon **clock** (your original design, pixel-identical), the **step goals** card and the **music** player,
-fed by the Meow Island Android app over Bluetooth LE.
+Six screens on the 2.8" 240×320 TFT: the neon **clock** (your original design, pixel-identical), the **step goals** card, the **music** player,
+phone **screen time**, **notifications** and a **custom** design rendered from HTML on the phone, fed by the Meow Island Android app over Bluetooth LE.
+The music screen shows provider-independent track metadata, cached album art, synced/plain lyrics (rendered on the phone so Hindi, Urdu/Arabic RTL,
+Korean, Japanese and other scripts work) and a video mode with a bottom progress bar. See `../docs/MUSIC.md`.
 
 ## Hardware (unchanged from your working sketch)
 ESP32 DevKit V1 · ST7789 SPI 240×320 · CS 5 · DC 2 · RST 4 · SCK 18 · MOSI 23 · backlight to 3.3 V · the **BOOT** button (GPIO0) is used as the only input.
@@ -51,7 +53,7 @@ The firmware now has six screens: Clock, Steps, Music, Screen time, Notification
 - A new upload is written to `/custom.tmp` first and replaces the old file only after the CRC-32 matched and the whole file validated, so the flash must hold both for a moment: with the 190 KB area the worst case (two 64 KB files plus filesystem overhead) should fit but is untested; typical designs are far smaller. If the device reports "out of storage space" use the 1.5 MB scheme. If the board was flashed with a scheme that has no data partition, the custom screen reports an error and every other screen keeps working.
 - `LittleFS.begin(true)` formats the data partition the first time it is used. Nothing else in the sketch uses that partition.
 
-**RAM use.** The custom image is never held in RAM (it is decoded 8 rows at a time, about 3.8 KB). Album art is one 80x80 RGB565 block (12.8 KB) allocated the first time art arrives. The BLE image queue is 20 frames (about 4 KB).
+**RAM use.** The custom image is never held in RAM (it is decoded 8 rows at a time, about 3.8 KB). Album art is one 80x80 RGB565 block (12.8 KB) allocated the first time art arrives. The phone-rendered lyric mask is 2 240 bytes. The BLE image queue is 20 frames and the lyric queue 16 frames (about 7 KB together).
 
 **Notifications** are kept in RAM only and are never written to flash.
 

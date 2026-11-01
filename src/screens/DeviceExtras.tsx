@@ -3,20 +3,40 @@ import { AppState, Alert, View } from 'react-native';
 import { Btn, Card, Chip, ErrorBox, H, Sub, Toggle } from '../ui';
 import { devx, deviceExtrasAvailable, native } from '../native';
 
-/** Device screen cards for the notification display, the Spotify lyrics source and the entry to the custom HTML screen. */
+/** Device screen cards for the notification display, the online lyrics source and the entry to the custom HTML screen. */
+/** Plain-language meaning of the lyric state the phone reports (DeviceProtocol LY_*). */
+function lyricStatus(state: number): string {
+  switch (state) {
+    case 1: return 'Looking up lyrics…';
+    case 2: return 'Time-synchronised lyrics found for this song.';
+    case 3: return 'No lyrics found for this song.';
+    case 4: return 'Online lyrics are off.';
+    case 5: return 'The lyrics service could not be reached.';
+    case 6: return 'Only plain lyrics exist for this song: they are shown without timing.';
+    default: return 'Play a song in any music app to look up its lyrics.';
+  }
+}
+
 export function DeviceExtrasCards({ ready, openCustom }: { ready: boolean; openCustom: () => void }) {
   const [n, setN] = useState<{ enabled: boolean; access: boolean; count: number; preview: boolean } | null>(null);
-  const [ly, setLy] = useState<'off' | 'lrclib'>('off');
+  const [ly, setLy] = useState<'off' | 'online'>('off');
+  const [lyInfo, setLyInfo] = useState<{ state: number; detail: string; source: string }>({ state: 0, detail: '', source: '' });
   const [err, setErr] = useState('');
 
   const load = useCallback(async () => {
     if (!deviceExtrasAvailable) return;
-    try { setN(await devx.notifsGet()); const l = await devx.lyricsGet(); if (l) setLy(l.provider === 'lrclib' ? 'lrclib' : 'off'); setErr(''); } catch (e: any) { setErr(e?.message ?? 'Could not read the settings'); }
+    try {
+      setN(await devx.notifsGet());
+      const l = await devx.lyricsGet();
+      if (l) { setLy(l.provider === 'online' ? 'online' : 'off'); setLyInfo({ state: l.state, detail: l.detail || '', source: l.source || '' }); }
+      setErr('');
+    } catch (e: any) { setErr(e?.message ?? 'Could not read the settings'); }
   }, []);
   useEffect(() => {
     load();
+    const poll = setInterval(load, 4000);                      // the lyric state changes while a song plays
     const sub = AppState.addEventListener('change', (st) => { if (st === 'active') load(); });   // coming back from Android's notification-access screen
-    return () => sub.remove();
+    return () => { sub.remove(); clearInterval(poll); };
   }, [load]);
 
   if (!deviceExtrasAvailable) return <Card><H>New display screens</H><Sub>This APK was built before the new display screens were added. Rebuild the app (see the README) to use them.</Sub></Card>;
@@ -24,9 +44,9 @@ export function DeviceExtrasCards({ ready, openCustom }: { ready: boolean; openC
   const toggleNotifs = async (on: boolean) => { try { await devx.notifsSetEnabled(on); await load(); } catch (e: any) { setErr(e?.message ?? 'Failed'); } };
   const setLyrics = async (on: boolean) => {
     if (!on) { try { await devx.lyricsSetProvider('off'); setLy('off'); } catch (e: any) { setErr(e?.message ?? 'Failed'); } return; }
-    Alert.alert('Turn on online lyrics?', 'For Spotify, the title, artist and length of the song that is playing are sent over HTTPS to lrclib.net, a free community lyrics database, to look up time-synced lyrics. Nothing else is sent. Many songs have no synced lyrics. Without this switch no lyrics are ever fetched.', [
+    Alert.alert('Turn on online lyrics?', 'The title, artist, album and length of the song that is playing are sent over HTTPS to LRCLIB (lrclib.net) and, if it has no answer, to lyrics.ovh. Both are free public lyrics services. Nothing else is sent: no account, no notification content, no device identifier. Lyrics are fetched for every music app, not just Spotify; YouTube and video apps are never looked up. Time-synced lyrics are shown in step with playback; plain lyrics are shown without timing. Without this switch no lyrics are ever fetched.', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Turn on', onPress: async () => { try { await devx.lyricsSetProvider('lrclib'); setLy('lrclib'); } catch (e: any) { setErr(e?.message ?? 'Failed'); } } },
+      { text: 'Turn on', onPress: async () => { try { await devx.lyricsSetProvider('online'); setLy('online'); } catch (e: any) { setErr(e?.message ?? 'Failed'); } } },
     ]);
   };
 
@@ -47,10 +67,11 @@ export function DeviceExtrasCards({ ready, openCustom }: { ready: boolean; openC
       </Card>
 
       <Card>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><H>Music: lyrics and captions</H><Chip ok={ly === 'lrclib'} label={ly === 'lrclib' ? 'Lyrics on' : 'Lyrics off'} /></View>
-        <Sub>The Music screen shows album art, title, artist and progress from the player on this phone. Synced lyrics need an outside source: Android does not provide lyrics and Spotify has no public lyrics service, so none are scraped. You can opt in to LRCLIB (below); with it off the display says "Lyrics are off".</Sub>
-        <Sub>Captions: Android does not hand out the captions of YouTube, Brave or other players, so for those apps the display says "Captions unavailable". Nothing is ever invented.</Sub>
-        <Toggle label="Look up synced lyrics for Spotify (LRCLIB)" value={ly === 'lrclib'} onChange={setLyrics} />
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><H>Music: lyrics</H><Chip ok={ly === 'online'} label={ly === 'online' ? 'Lyrics on' : 'Lyrics off'} /></View>
+        <Sub>The Music screen shows album art, title, artist and progress from whichever player is on this phone. Online lyrics work for every music app that publishes title and artist (Spotify, Amazon Music, Apple Music, Tidal, Deezer, JioSaavn and others), not just Spotify. YouTube and video apps are excluded: they show only their thumbnail, title, duration and progress.</Sub>
+        <Sub>LRCLIB (lrclib.net) is tried first for time-synchronised lyrics; if it has no answer, lyrics.ovh supplies plain lyrics, which are shown without timing. Every line is rendered on the phone, so Hindi, Urdu, Arabic, Korean, Japanese and other scripts are shown correctly (right-to-left included) instead of being dropped by the display's ASCII fonts. Lyrics are never translated or invented. The line under the switch tells you what the last lookup answered.</Sub>
+        <Toggle label="Look up lyrics online (LRCLIB, then lyrics.ovh)" value={ly === 'online'} onChange={setLyrics} />
+        {ly === 'online' && <Sub>{lyricStatus(lyInfo.state)}{lyInfo.source ? ` Source: ${lyInfo.source}.` : ''}{lyInfo.detail ? ` (${lyInfo.detail})` : ''}</Sub>}
       </Card>
 
       <Card>

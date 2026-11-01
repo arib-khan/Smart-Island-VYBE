@@ -100,7 +100,10 @@ object DeviceLink {
     private var lastScreenTime: DeviceExtras.ScreenTime? = null; private var lastScreenTimeKey = ""; private var lastScreenTimeAt = 0L
     private var lastNotifKey = ""
     private var lastMusic2Key = ""; private var lastMusic2At = 0L
-    private var artKeyWanted = ""; private var artKeyOnDevice = ""; private var artKeyFailed = ""
+    @Volatile private var artKeyWanted = ""; private var artKeyOnDevice = ""; private var artKeyFailed = ""
+    @Volatile private var artTriedKey = ""; @Volatile private var artRevWanted = -1; @Volatile private var artBytes: ByteArray? = null; @Volatile private var artLoading = false
+    private var artCrcBytes: ByteArray? = null; private var artCrcValue = 0L
+    private var lastBandKey = ""; private var lastBandAt = 0L
 
     /** Short timeline of what the link did (shown in the app under Connection log, also in logcat as MeowLink). Never contains Wi-Fi details. */
     private fun diag(msg: String) {
@@ -612,7 +615,8 @@ object DeviceLink {
         diag("ready (mtu $mtu)")
         prefs().edit().putBoolean("paired", true).apply()
         lastStepsKey = ""; lastMusicKey = ""; lastTimeAt = 0
-        lastScreenTime = null; lastScreenTimeKey = ""; lastNotifKey = ""; lastMusic2Key = ""; artKeyOnDevice = ""; artKeyFailed = ""
+        lastScreenTime = null; lastScreenTimeKey = ""; lastNotifKey = ""; lastMusic2Key = ""
+        artKeyOnDevice = ""; artKeyFailed = ""; artTriedKey = ""; lastBandKey = ""
         CustomScreen.onConnected()
         setState(S_CONNECTED)
         send(DeviceProtocol.hello())
@@ -741,42 +745,102 @@ object DeviceLink {
 
     private fun syncMusicExtras(force: Boolean, now: Long) {
         val ctx = appCtx ?: return
+        val track = MediaListener.current
         val snap = MediaListener.snapshot
-        val active = snap["active"] == true
-        val pkg = (snap["app"] as? String) ?: ""
-        val title = (snap["title"] as? String) ?: ""; val artist = (snap["artist"] as? String) ?: ""
-        val durMs = (snap["duration"] as? Double)?.toLong() ?: 0L
-        val playing = snap["playing"] == true
-        val pos = MusicProgress.now((snap["position"] as? Double)?.toLong() ?: 0L, (snap["posAt"] as? Double)?.toLong() ?: 0L, playing, now, durMs)
+        val active = track?.active ?: (snap["active"] == true)
+        val pkg = track?.pkg ?: (snap["app"] as? String) ?: ""
+        val title = track?.title ?: (snap["title"] as? String) ?: ""
+        val artist = track?.artist ?: (snap["artist"] as? String) ?: ""
+        val album = track?.album ?: (snap["album"] as? String) ?: ""
+        val durMs = track?.durationMs ?: (snap["duration"] as? Double)?.toLong() ?: 0L
+        val playing = track?.playing ?: (snap["playing"] == true)
+        val pos = track?.positionNow(now) ?: MusicProgress.now((snap["position"] as? Double)?.toLong() ?: 0L,
+            (snap["posAt"] as? Double)?.toLong() ?: 0L, playing, now, durMs)
         val src = if (active) DeviceExtras.sourceLabel(ctx, pkg) else ""
+        val video = track?.isVideo ?: (snap["video"] == true)
+        val trackKey = track?.key() ?: Provider.cacheKey(pkg, (snap["trackId"] as? String) ?: "", title, artist, album)
 
-        // lyrics: only for Spotify and only from the provider the user switched on; everything else says "Captions unavailable" on the display
-        DeviceExtras.Lyrics.update(ctx, active && DeviceExtras.isSpotify(pkg), title, artist, (durMs / 1000L).toInt())
-        val lyState = if (active && DeviceExtras.isSpotify(pkg)) DeviceExtras.Lyrics.state else DeviceProtocol.LY_NA
+        // Lyrics for every music provider, not just Spotify. Video apps (YouTube, streaming video) never get a lookup.
+        val eligible = active && title.isNotBlank() && !video
+        DeviceExtras.Lyrics.update(ctx, eligible, title, artist, album, (durMs / 1000L).toInt())
+        val lyState = if (eligible) DeviceExtras.Lyrics.state else DeviceProtocol.LY_NA
+        val synced = lyState == DeviceProtocol.LY_AVAILABLE
 
-        // album art: one small transfer per track (never for progress or text changes)
-        val art = if (active) MediaListener.artSmall else null
-        val artKey = if (art != null) "${(snap["art"] as? String)?.hashCode() ?: 0}|$title|$artist" else ""
-        if (artKey != artKeyWanted) artKeyWanted = artKey
-        if (artKeyWanted.isNotEmpty() && art != null && artKeyWanted != artKeyOnDevice && artKeyWanted != artKeyFailed && !ImageTransfers.busy() && status?.hasExt == true) {
-            val k = artKeyWanted
-            ImageTransfers.start(
-                DeviceProtocol.KIND_ART, DeviceExtras.artBytes(art), DeviceExtras.ART, DeviceExtras.ART,
-                { ok, reason, _ ->
-                    // an abort or a lost link (reason 0) is retried later, a real failure is not
-                    if (ok) { artKeyOnDevice = k } else if (reason != 0) { artKeyFailed = k }
-                    requestSync()
-                },
-                { _, _ -> }
-            )
+        // album art: the cached 80x80 RGB565 image is sent once per track, never for progress or text changes
+        val artSource = if (active) MediaListener.artSmall else null
+        val artKey = if (active && artSource != null) trackKey else ""
+        val artRev = MediaListener.artRev
+        val keyChanged = artKey != artKeyWanted
+        if (keyChanged || artRev != artRevWanted) {
+            artKeyWanted = artKey; artRevWanted = artRev
+            artTriedKey = ""; artLoading = false
+            if (keyChanged) artKeyFailed = ""
+            // a cached cover is reused for the same track; a genuinely new bitmap is decoded again
+            artBytes = if (artKey.isEmpty()) null else if (keyChanged) ArtCache.memory(artKey) else null
+        }
+        if (artKey.isNotEmpty() && artBytes == null && !artLoading && artKey != artTriedKey) {
+            artTriedKey = artKey; artLoading = true
+            val wantRev = artRev
+            ArtCache.request(ctx, artKey, artSource) { bytes ->
+                if (artKeyWanted == artKey && artRevWanted == wantRev) {
+                    artBytes = bytes
+                    artLoading = false
+                    if (bytes != null) DeviceLink.requestSync()
+                }
+            }
+        }
+        val bytes = artBytes
+        if (bytes != null && bytes.size == ArtCache.BYTES && artKeyWanted.isNotEmpty()) {
+            val crc = if (bytes === artCrcBytes) artCrcValue else DeviceProtocol.crc32(bytes).also { artCrcBytes = bytes; artCrcValue = it }
+            // the device may still hold exactly this image (replay / app switch): then no transfer at all is needed
+            val alreadyThere = artKeyWanted == artKeyOnDevice || (crc != 0L && status?.artCrc == crc)
+            if (alreadyThere) {
+                artKeyOnDevice = artKeyWanted
+            } else if (!ImageTransfers.busy() && status?.hasExt == true && artKeyWanted != artKeyFailed) {
+                val k = artKeyWanted
+                ImageTransfers.start(
+                    DeviceProtocol.KIND_ART, bytes, ArtCache.ART, ArtCache.ART,
+                    { ok, reason, _ ->
+                        // an abort or a lost link (reason 0) is retried later, a real failure is not
+                        if (ok) { artKeyOnDevice = k } else if (reason != 0) { artKeyFailed = k }
+                        requestSync()
+                    },
+                    { _, _ -> }
+                )
+            }
         }
         val hasArt = artKeyWanted.isNotEmpty() && artKeyWanted == artKeyOnDevice
 
         var idx = 0; var prev = ""; var cur = ""; var next = ""
-        if (lyState == DeviceProtocol.LY_AVAILABLE) { val c = DeviceExtras.Lyrics.current(pos); idx = (c.idx + 1).coerceIn(0, 65535); prev = c.prev; cur = c.cur; next = c.next }
-        val key = "$src|$hasArt|$lyState|$idx|$prev|$cur|$next"
+        if (synced) {
+            val c = DeviceExtras.Lyrics.current(pos)
+            idx = (c.idx + 1).coerceIn(0, 65535); prev = c.prev; cur = c.cur; next = c.next
+        } else if (lyState == DeviceProtocol.LY_UNSYNCED) {
+            val c = DeviceExtras.Lyrics.plainCurrent(pos)
+            idx = (c.idx + 1).coerceIn(0, 65535); prev = c.prev; cur = c.cur; next = c.next
+        }
+        val key = "$src|$video|$hasArt|$lyState|$synced|$idx|$prev|$cur|$next"
         if (force || key != lastMusic2Key || now - lastMusic2At > 30_000L) {
-            if (sendState(DeviceProtocol.music2(hasArt, lyState == DeviceProtocol.LY_AVAILABLE, lyState, idx, src, prev, cur, next))) { lastMusic2Key = key; lastMusic2At = now }
+            if (sendState(DeviceProtocol.music2(hasArt, synced, lyState, idx, src, prev, cur, next, video))) { lastMusic2Key = key; lastMusic2At = now }
+        }
+
+        // The phone renders the three lyric lines into a 1-bit mask: the TFT has no Unicode fonts, and Android does the shaping,
+        // bidi and font fallback. One small transfer per changed line, never for progress.
+        val bandKey = if (lyState == DeviceProtocol.LY_AVAILABLE || lyState == DeviceProtocol.LY_UNSYNCED) "$trackKey|$idx|$prev|$cur|$next" else ""
+        if (bandKey.isEmpty()) {
+            if (lastBandKey.isNotEmpty()) { send(DeviceProtocol.lyricClear()); lastBandKey = "" }
+        } else if (bandKey != lastBandKey && now - lastBandAt >= 250L) {
+            val mask = try { LyricBandRenderer.render(prev, cur, next) } catch (e: Exception) { ByteArray(0) }
+            if (mask.size == DeviceProtocol.LYR_BYTES) {
+                val token = (trackKey.hashCode() and 0xFF).let { if (it == 0) 1 else it }
+                var off = 0; var seq = 0
+                while (off < mask.size) {
+                    val n = minOf(DeviceProtocol.LYR_CHUNK, mask.size - off)
+                    send(DeviceProtocol.lyricBand(token, seq, idx, mask, off, n))
+                    off += n; seq++
+                }
+                lastBandKey = bandKey; lastBandAt = now
+            }
         }
     }
 

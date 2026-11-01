@@ -50,6 +50,12 @@ test('phone and firmware use the same GATT UUIDs, frame magic, protocol version 
   assert.strictEqual(parseInt((kt.match(/const val MAGIC = (0x[0-9A-Fa-f]+)/) || [])[1], 16), parseInt((proto.match(/FRAME_MAGIC\s*=\s*(0x[0-9A-Fa-f]+)/) || [])[1], 16));
   assert.strictEqual((kt.match(/const val PROTO = (\d+)/) || [])[1], (proto.match(/PROTO_VERSION\s*=\s*(\d+)/) || [])[1]);
   assert.ok(/require\(payload\.size <= 200\)|payload\.size <= 200/.test(kt) && /MAX_PAYLOAD\s*=\s*200/.test(proto), 'both sides cap a frame payload at 200 bytes');
+  assert.ok(/STATUS_FULL_LEN = 23/.test(kt) && /STATUS_EXT_LEN = 13/.test(kt), 'phone status is 23 bytes');
+  assert.ok(/STATUS_EXT_LEN = 13, STATUS_FULL_LEN = STATUS_LEN \+ STATUS_EXT_LEN/.test(proto), 'firmware status is 10 + 13 bytes');
+  assert.strictEqual((kt.match(/MSG_LYRIC = (0x[0-9A-Fa-f]+)/) || [])[1], (proto.match(/MSG_LYRIC = (0x[0-9A-Fa-f]+)/) || [])[1], 'the lyric message has the same type on both sides');
+  assert.strictEqual((kt.match(/IMG_CHUNK = (\d+)/) || [])[1], '190');
+  assert.ok(/IMG_MAX_CHUNK = 190/.test(proto), 'firmware accepts the phone image chunk size');
+  assert.ok(/artCrc/.test(kt) && /artCrc/.test(proto), 'the device reports its album-art CRC');
   assert.ok(/WRITE_ENC \| NIMBLE_PROPERTY::WRITE_AUTHEN/.test(link), 'firmware requires an encrypted + authenticated link for writes (the phone must therefore verify encryption before declaring the link ready)');
 });
 test('the pairing code path has timeouts, a cancel and a repair on the phone (regression guard for the stuck "Pairing…" bug)', () => {
@@ -58,4 +64,55 @@ test('the pairing code path has timeouts, a cancel and a repair on the phone (re
   for (const needle of ['PAIR_BOND_TIMEOUT_MS', 'PAIR_CONNECT_TIMEOUT_MS', 'fun cancelPair', 'fun repair', 'private fun pairPoll', 'private fun failPairing', 'private fun armStep', 'verifying = true', 'KEY_MISSING', 'CLOSE_GRACE_MS'])
     assert.ok(link.includes(needle), 'DeviceLink.kt lost: ' + needle);
   assert.ok(!/gatt\?\.disconnect\(\) \} catch \(e: Exception\) \{ \}\s*\n\s*try \{ gatt\?\.close\(\)/.test(link), 'disconnect() must not be followed immediately by close()');
+});
+
+test('lyrics: multiple legitimate providers, accurate matching and plain-lyrics fallback', () => {
+  const fs = require('fs'), path = require('path');
+  const root = path.join(__dirname, '..');
+  const kt = fs.readFileSync(path.join(root, 'plugins', 'kotlin', 'LrcLibProvider.kt'), 'utf8');
+  const ovh = fs.readFileSync(path.join(root, 'plugins', 'kotlin', 'LyricsOvhProvider.kt'), 'utf8');
+  const logic = fs.readFileSync(path.join(root, 'plugins', 'kotlin', 'LyricsLogic.kt'), 'utf8');
+  assert.ok(/"get\?track_name="/.test(kt) && /"search\?track_name="/.test(kt) && /"search\?q="/.test(kt), 'LRCLIB exact, search, cleaned search and free-text queries');
+  assert.ok(/LyricsMatcher\.pick/.test(kt) && /versionCompatible/.test(logic) && /durationScore/.test(logic), 'search results are matched by title/artist/album/length and version markers');
+  assert.ok(/api\.lyrics\.ovh/.test(ovh) && /supportsSynced = false/.test(ovh), 'lyrics.ovh is the plain-lyrics fallback');
+  assert.ok(/class LyricsService/.test(logic) && /providers/.test(logic) && /LY_UNSYNCED/.test(logic), 'provider chain falls back and can return plain lyrics');
+  assert.ok(/PlainLyrics/.test(logic) && /\\p\{M\}/.test(logic), 'plain lyrics keep Unicode combining marks (Devanagari/Arabic)');
+  assert.ok(!/isSpotify\(pkg\)/.test(fs.readFileSync(path.join(root, 'plugins', 'kotlin', 'DeviceLink.kt'), 'utf8')), 'lyrics are no longer gated on Spotify');
+  assert.ok(/r\.code == 429 \|\| r\.code >= 500/.test(kt), 'only 429/5xx are "service busy"');
+  assert.ok(/Retry-After/.test(kt) && /MIN_GAP_MS/.test(kt), 'LRCLIB rate limits and Retry-After are respected');
+  assert.ok(!/if \(code != 200\) return LyricsResult\(DeviceProtocol\.LY_OFFLINE/.test(kt), 'a 400/404 answer must never be reported as "offline"');
+});
+test('captions: YouTube caption/subtitle extraction is gone, not just switched off', () => {
+  const fs = require('fs'), path = require('path');
+  const root = path.join(__dirname, '..');
+  assert.ok(!fs.existsSync(path.join(root, 'plugins/kotlin/MeowCaptionService.kt')), 'caption accessibility service removed');
+  assert.ok(!fs.existsSync(path.join(root, 'plugins/widgets/res/xml/meow_caption_config.xml')), 'caption service config removed');
+  const manifest = fs.readFileSync(path.join(root, 'plugins/withIsland.js'), 'utf8');
+  assert.ok(!manifest.includes('.MeowCaptionService') && !manifest.includes('meow_caption_config'), 'no caption service in the manifest');
+  const extras = fs.readFileSync(path.join(root, 'plugins/kotlin/DeviceExtras.kt'), 'utf8');
+  assert.ok(!/Captions|captionState|captionsEnabled/.test(extras), 'no caption buffer or caption state anymore');
+  const ui = fs.readFileSync(path.join(root, 'src/screens/DeviceExtras.tsx'), 'utf8');
+  assert.ok(!/caption/i.test(ui), 'no caption switch in the app');
+  const proto = fs.readFileSync(path.join(root, 'firmware/MeowIsland/protocol.h'), 'utf8');
+  assert.ok(!/caption/i.test(proto), 'protocol no longer documents caption states');
+});
+test('album art: persistent cache, stable key, no repeat transfer and stale-cover protection', () => {
+  const fs = require('fs'), path = require('path');
+  const root = path.join(__dirname, '..');
+  const art = fs.readFileSync(path.join(root, 'plugins/kotlin/ArtCache.kt'), 'utf8');
+  const link = fs.readFileSync(path.join(root, 'plugins/kotlin/DeviceLink.kt'), 'utf8');
+  assert.ok(/filesDir/.test(art) && /artcache/.test(art) && /sha256/.test(art), 'artwork is cached on disk under a stable hash');
+  assert.ok(/AppWidgetManager|LinkedHashMap/.test(art) && /MAX_FILES/.test(art), 'memory LRU + bounded disk cache');
+  assert.ok(/MediaListener\.artRev/.test(link) && /ArtCache\.request/.test(link), 'new artwork is decoded asynchronously and a changed cover is detected');
+  assert.ok(/status\?\.artCrc == crc/.test(link), 'a cover the display already holds is not transferred again');
+  assert.ok(/artKeyWanted == artKeyOnDevice/.test(link) && /artKeyFailed/.test(link), 'failed/interrupted transfers do not loop, and the old cover is not marked current');
+});
+test('YouTube: video plays get metadata/progress but never lyrics', () => {
+  const fs = require('fs'), path = require('path');
+  const root = path.join(__dirname, '..');
+  const model = fs.readFileSync(path.join(root, 'plugins/kotlin/NowPlaying.kt'), 'utf8');
+  const screen = fs.readFileSync(path.join(root, 'firmware/MeowIsland/music_screen.h'), 'utf8');
+  assert.ok(/isVideo/.test(model) && /lyricsEligible/.test(model), 'the model marks video apps and excludes them from lyrics');
+  assert.ok(/musicVideo/.test(screen) && /drawBottomProgress/.test(screen), 'the display has a video mode and a bottom progress bar');
+  assert.ok(!/Live Caption|LY_CAPTION|lyricState == 7|lyricState == 8/.test(screen), 'no caption states remain on the music screen');
 });

@@ -35,7 +35,10 @@ static std::string summarize(const Frame& f) {
       std::string items; for (int i = 0; i < d.n; i++) { if (i) items += ";"; items += std::to_string(d.items[i].ageMin) + ":" + d.items[i].app + "|" + d.items[i].title + "|" + d.items[i].text; }
       snprintf(b, sizeof b, "on=%d access=%d n=%d %s", d.enabled, d.needsAccess, d.n, items.c_str()); return b; }
     case MSG_MUSIC2: { Music2Data m; if (!parseMusic2(f.payload, f.len, m)) return "REJECTED";
-      snprintf(b, sizeof b, "art=%d sync=%d ly=%d idx=%d src=[%s] prev=[%s] cur=[%s] next=[%s]", m.hasArt, m.synced, m.lyricState, m.lineIdx, m.src, m.prev, m.cur, m.next); return b; }
+      snprintf(b, sizeof b, "art=%d sync=%d video=%d ly=%d idx=%d src=[%s] prev=[%s] cur=[%s] next=[%s]", m.hasArt, m.synced, m.video, m.lyricState, m.lineIdx, m.src, m.prev, m.cur, m.next); return b; }
+    case MSG_LYRIC: { if (isLyricClear(f.payload, f.len)) return "clear";
+      LyricChunk c; if (!parseLyricChunk(f.payload, f.len, c)) return "REJECTED";
+      snprintf(b, sizeof b, "token=%d seq=%d line=%d w=%d h=%d n=%d", c.token, c.seq, c.line, c.w, c.h, c.len); return b; }
     case MSG_IMG_BEGIN: { ImgBegin x; if (!parseImgBegin(f.payload, f.len, x)) return "REJECTED";
       snprintf(b, sizeof b, "xfer=%d kind=%d total=%u crc=%08x chunk=%d w=%d h=%d", x.xfer, x.kind, x.total, x.crc, x.chunk, x.w, x.h); return b; }
     case MSG_IMG_DATA: { if (f.len < 3) return "REJECTED"; std::string hx; for (int i = 3; i < f.len; i++) { char c[4]; snprintf(c, sizeof c, "%02x", f.payload[i]); hx += c; } snprintf(b, sizeof b, "xfer=%d seq=%d n=%d data=%s", f.payload[0], rd16(f.payload + 1), f.len - 3, hx.c_str()); return b; }
@@ -61,7 +64,7 @@ int main(int argc, char** argv) {
   std::vector<Vec> vecs; std::string line;
   while (std::getline(in, line)) { size_t a = line.find('|'), b = line.find('|', a + 1); if (a == std::string::npos || b == std::string::npos) continue; vecs.push_back({line.substr(0, a), unhex(line.substr(a + 1, b - a - 1)), line.substr(b + 1)}); }
   CHECK(vecs.size() >= 15, "vectors loaded");
-  { int fresh = 0; for (auto& v : vecs) if (v.name.rfind("SCREENTIME", 0) == 0 || v.name.rfind("NOTIFS", 0) == 0 || v.name.rfind("MUSIC2", 0) == 0 || v.name.rfind("IMG_", 0) == 0 || v.name == "STATUS_EXT") fresh++; CHECK(fresh >= 14, "vectors for the new messages are present"); }
+  { int fresh = 0; for (auto& v : vecs) if (v.name.rfind("SCREENTIME", 0) == 0 || v.name.rfind("NOTIFS", 0) == 0 || v.name.rfind("MUSIC2", 0) == 0 || v.name.rfind("LYRIC", 0) == 0 || v.name.rfind("IMG_", 0) == 0 || v.name == "STATUS_EXT") fresh++; CHECK(fresh >= 16, "vectors for the new messages are present"); }
 
   // 1. every vector parses to exactly the values the phone encoded
   std::vector<uint8_t> stream; std::vector<std::string> expected;
@@ -72,9 +75,9 @@ int main(int argc, char** argv) {
       CHECK(memcmp(o, v.bytes.data(), STATUS_LEN) == 0 && v.bytes.size() == STATUS_LEN, "status bytes identical to the phone's expectation");
       continue;
     }
-    if (v.name == "STATUS_EXT") {   // identical to what the phone parses: 10 status bytes + 9 transfer bytes
+    if (v.name == "STATUS_EXT") {   // identical to what the phone parses: 10 status bytes + 13 transfer bytes
       Status s; s.screen = 5; s.wifiState = 2; s.timeValid = true; s.hasWifi = true; s.musicFresh = true; s.bonds = 1; s.heapKb = 120; s.fwMajor = 1; s.fwMinor = 0;
-      XferStatus x; x.state = XFER_RECEIVING; x.id = 7; x.nextSeq = 300; x.reason = XR_NONE; x.customCrc = 0xCBF43926u;
+      XferStatus x; x.state = XFER_RECEIVING; x.id = 7; x.nextSeq = 300; x.reason = XR_NONE; x.customCrc = 0xCBF43926u; x.artCrc = 0x11223344u;
       uint8_t o[STATUS_FULL_LEN]; encodeStatus(s, o); encodeStatusExt(x, o + STATUS_LEN);
       CHECK(v.bytes.size() == STATUS_FULL_LEN && memcmp(o, v.bytes.data(), STATUS_FULL_LEN) == 0, "extended status bytes identical to the phone's expectation");
       continue;
@@ -116,6 +119,12 @@ int main(int argc, char** argv) {
     wr32(p + 4, 8000); p[9] = 77; p[10] = 77; p[11] = 77; p[12] = 0xFF; CHECK(parseSteps(p, STEPS_LEN, s) && s.label == 0 && s.hint == 0 && s.subtitle == 0 && s.levels[0] == 0, "steps out-of-range codes and levels fall back to 0"); }
   { TimeData t; uint8_t p[6]; wr32(p, 12345); wr16(p + 4, 0); CHECK(!parseTime(p, 6, t), "time before 2023 rejected"); wr32(p, 1800000000UL); wr16(p + 4, (uint16_t)(int16_t)(15 * 60)); CHECK(!parseTime(p, 6, t), "offset beyond +14h rejected"); }
   { char tz[16]; tzString(-570, tz); CHECK(strcmp(tz, "<-0930>+9:30") == 0, "negative half-hour offset"); tzString(765, tz); CHECK(strcmp(tz, "<+1245>-12:45") == 0, "+12:45 (Chatham)"); tzString(60, tz); CHECK(strcmp(tz, "<+0100>-1") == 0, "whole hour"); }
+  { LyricChunk c; uint8_t p[8 + LYR_CHUNK] = {0}; wr16(p + 4, LYR_W); wr16(p + 6, LYR_H);
+    CHECK(parseLyricChunk(p, sizeof p, c) && c.len == LYR_CHUNK && c.seq == 0, "lyric chunk parses");
+    uint8_t clear[] = {0, 0}; CHECK(isLyricClear(clear, 2), "lyric clear marker");
+    uint8_t badw[8 + 4] = {0}; wr16(badw + 4, LYR_W - 1); wr16(badw + 6, LYR_H); CHECK(!parseLyricChunk(badw, sizeof badw, c), "wrong lyric mask width rejected");
+    uint8_t badseq[8 + 4] = {0}; badseq[1] = 13; wr16(badseq + 4, LYR_W); wr16(badseq + 6, LYR_H); CHECK(!parseLyricChunk(badseq, sizeof badseq, c), "lyric chunk beyond the mask rejected");
+    uint8_t shortc[8] = {0}; wr16(shortc + 4, LYR_W); wr16(shortc + 6, LYR_H); CHECK(!parseLyricChunk(shortc, sizeof shortc, c), "empty lyric chunk rejected"); }
 
   printf("firmware protocol tests: %d passed, %d failed\n", passed, failed);
   return failed ? 1 : 0;

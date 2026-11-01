@@ -7,7 +7,8 @@
     "prebuild": "expo prebuild --platform android",
     "android": "expo run:android",
     "apk": "expo prebuild --platform android --clean && cd android && ./gradlew assembleRelease",
-    "test": "node tests/run.js"
+    "test": "node tests/run.js",
+    "ios": "expo run:ios"
   },
   "dependencies": {
     "expo": "~52.0.0",

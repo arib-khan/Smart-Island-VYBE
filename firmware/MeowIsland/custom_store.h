@@ -19,6 +19,7 @@ static bool     fsReady = false;
 static uint32_t customCrc = 0;                    // 0 = no (valid) custom image
 static uint32_t customRev = 0;                    // bumps whenever the stored image changes (the screen redraws)
 static uint16_t* artBuf = nullptr; static uint16_t artW = 0, artH = 0; static bool artReady = false; static uint32_t artRev = 0;
+static uint32_t artCrc = 0;                       // CRC-32 of the art in RAM, 0 = none: lets the phone skip a repeated transfer
 
 // Colours arrive as RGB565 from the phone; boards with swapped red/blue need the fields exchanged.
 static inline uint16_t fixColor(uint16_t c) { return SWAP_RED_BLUE ? (uint16_t)(((c & 0x1F) << 11) | (c & 0x07E0) | (c >> 11)) : c; }
@@ -58,6 +59,7 @@ static void customBoot() {
 struct FlashSink : meow::RxSink {
   File tmp; uint8_t artKind = 0; uint32_t artWant = 0, artAt = 0;
   uint32_t storedCustomCrc() override { return customCrc; }
+  uint32_t storedArtCrc() override { return artCrc; }
   bool open(uint8_t kind, uint32_t total, uint16_t w, uint16_t h, uint8_t& reason) override {
     if (kind == meow::KIND_CUSTOM) {
       if (!fsReady) { reason = meow::XR_FLASH; return false; }
@@ -69,6 +71,7 @@ struct FlashSink : meow::RxSink {
       return true;
     }
     artReady = false;                                       // the old art is overwritten from now on
+    artCrc = 0;                                             // the phone must not think the previous cover is still current
     if (!artBuf || artW != w || artH != h) {
       if (artBuf) { free(artBuf); artBuf = nullptr; }
       artBuf = (uint16_t*)malloc((size_t)w * h * 2);
@@ -86,7 +89,7 @@ struct FlashSink : meow::RxSink {
     if (kind == meow::KIND_ART) {
       if (artAt != artWant) { reason = meow::XR_SEQUENCE; return false; }
       for (size_t i = 0; i < (size_t)artW * artH; i++) artBuf[i] = fixColor(artBuf[i]);    // little-endian bytes from the phone are already host order on the ESP32
-      artReady = true; artRev++; return true;
+      artReady = true; artCrc = crc ? crc : 1; artRev++; return true;
     }
     tmp.flush(); tmp.close();
     if (!customInspect(CUSTOM_TMP)) { LittleFS.remove(CUSTOM_TMP); reason = meow::XR_BAD_IMAGE; return false; }
@@ -96,9 +99,9 @@ struct FlashSink : meow::RxSink {
     }
     customCrc = crc ? crc : 1; customRev++; return true;
   }
-  void abort(uint8_t kind) override { if (kind == meow::KIND_CUSTOM) { if (tmp) tmp.close(); LittleFS.remove(CUSTOM_TMP); } else artReady = false; }
+  void abort(uint8_t kind) override { if (kind == meow::KIND_CUSTOM) { if (tmp) tmp.close(); LittleFS.remove(CUSTOM_TMP); } else { artReady = false; artCrc = 0; } }
   void deleteCustom() override { if (fsReady) { LittleFS.remove(CUSTOM_PATH); LittleFS.remove(CUSTOM_TMP); } customCrc = 0; customRev++; }
-  void clearArt() override { artReady = false; artRev++; }
+  void clearArt() override { artReady = false; artCrc = 0; artRev++; }
 };
 static FlashSink flashSink;
 static meow::ImageReceiver imgRx(&flashSink, TFT_W, TFT_H);

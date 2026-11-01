@@ -82,6 +82,9 @@ Denying a permission only disables the feature that needs it. Revoking one later
 Overlay: Start island, press Home, open another app: pill stays; Stop removes it. Permissions: each Grant button opens the right page; status flips after returning. Music: play in a media app; title/art/CD; pause stops rotation. Screen time: Add app (picker, search), set 1 min, use the app >1 min: 😡; leave: 😊 once. Notifications: grant Notification access, send yourself a notification. Reminders: schedule +2 min, background the app; it fires and shows on the island. Persistence: force-close and reopen; settings, limits and reminders remain.
 - [ ] Pill appears at top after Start island, over other apps
 - [ ] Play music (Spotify/YouTube Music): title, artist, art show; art spins; pausing stops spin
+- [ ] Settings › Meow Island Device › Music: lyrics on; play a song: synced lines or plain lines appear; switching tracks clears the old line and the old cover
+- [ ] Play a YouTube video: thumbnail/title/progress bar at the bottom, no lyrics or captions; playback controls on the phone still work
+- [ ] Replay a song already played: its cached cover and lyrics appear immediately; no repeated download/transfer
 - [ ] Send yourself a notification: preview appears for ~5 s
 - [ ] Schedule a reminder for 1 minute: island expands, notification fires; Snooze works; close the app and test again
 - [ ] Add a limit (package name e.g. `com.android.chrome`, 1 min), use the app >1 min: 😡 appears; leave the app: 😊 for ~2.5 s

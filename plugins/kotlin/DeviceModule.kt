@@ -69,8 +69,11 @@ class DeviceModule(private val ctx: ReactApplicationContext) : ReactContextBaseJ
     /** Clears the list on the display only. Notifications on the phone are not touched. */
     @ReactMethod fun deviceNotifsClear(p: Promise) { DeviceExtras.NotifStore.clear(); DeviceLink.notifsChanged(); p.resolve(true) }
 
-    // ------------------------------------------------------------------ lyrics (Spotify) source
-    @ReactMethod fun deviceLyricsGet(p: Promise) { p.resolve(JSONObject().put("provider", DeviceExtras.lyricsProvider(ctx)).put("state", DeviceExtras.Lyrics.state).toString()) }
+    // ------------------------------------------------------------------ online lyrics source (any music provider except video apps)
+    @ReactMethod fun deviceLyricsGet(p: Promise) {
+        p.resolve(JSONObject().put("provider", DeviceExtras.lyricsProvider(ctx)).put("state", DeviceExtras.Lyrics.state)
+            .put("detail", DeviceExtras.Lyrics.detail).put("source", DeviceExtras.Lyrics.providerName).toString())
+    }
     @ReactMethod fun deviceLyricsSetProvider(name: String, p: Promise) { DeviceExtras.setLyricsProvider(ctx, name); DeviceLink.requestSync(); p.resolve(DeviceExtras.lyricsProvider(ctx)) }
 
     // ------------------------------------------------------------------ custom HTML screen

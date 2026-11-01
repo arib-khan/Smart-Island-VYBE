@@ -21,21 +21,26 @@ object DeviceProtocol {
     // protocol additions (firmware/MeowIsland/protocol.h documents every byte)
     const val MSG_SCREENTIME = 0x09; const val MSG_NOTIFS = 0x0A; const val MSG_MUSIC2 = 0x0B
     const val MSG_IMG_BEGIN = 0x0C; const val MSG_IMG_DATA = 0x0D; const val MSG_IMG_END = 0x0E; const val MSG_IMG_CTRL = 0x0F
+    const val MSG_LYRIC = 0x10
 
     const val SCREEN_CLOCK = 0; const val SCREEN_STEPS = 1; const val SCREEN_MUSIC = 2
     const val SCREEN_SCREENTIME = 3; const val SCREEN_NOTIFS = 4; const val SCREEN_CUSTOM = 5; const val SCREEN_LAST = 5
     const val STEP_CELLS = 54
     const val MAX_TITLE = 48; const val MAX_ARTIST = 40
-    const val STATUS_LEN = 10; const val STATUS_EXT_LEN = 9; const val STATUS_FULL_LEN = 19
+    const val STATUS_LEN = 10; const val STATUS_EXT_LEN = 13; const val STATUS_FULL_LEN = 23
+    const val STATUS_EXT_LEGACY_LEN = 9                 // firmware before the art CRC: state/id/next/reason/customCrc
     const val ST_MAX_APPS = 4; const val ST_NAME = 14
     const val NT_MAX = 8; const val NT_APP = 12; const val NT_TITLE = 24; const val NT_TEXT = 48
     const val M2_SRC = 14; const val M2_PREV = 40; const val M2_CUR = 56; const val M2_NEXT = 40
     const val KIND_CUSTOM = 0; const val KIND_ART = 1
     const val CTRL_ABORT = 1; const val CTRL_DELETE_CUSTOM = 2; const val CTRL_CLEAR_ART = 3
-    const val IMG_CHUNK = 180
+    const val IMG_CHUNK = 190
     const val XFER_IDLE = 0; const val XFER_RECEIVING = 1; const val XFER_DONE = 2; const val XFER_FAILED = 3
     // lyric states carried by MUSIC2
     const val LY_NA = 0; const val LY_LOADING = 1; const val LY_AVAILABLE = 2; const val LY_UNAVAILABLE = 3; const val LY_PROVIDER_OFF = 4; const val LY_OFFLINE = 5; const val LY_UNSYNCED = 6
+    // lyric band (rendered on the phone so every script, RTL and CJK render correctly on the ASCII-only TFT)
+    const val LYR_W = 224; const val LYR_H = 80; const val LYR_ROW = LYR_W / 8; const val LYR_BYTES = LYR_ROW * LYR_H
+    const val LYR_CHUNK = 190
 
     fun frame(type: Int, payload: ByteArray = ByteArray(0)): ByteArray {
         require(payload.size <= 200) { "payload too large" }
@@ -140,13 +145,28 @@ object DeviceProtocol {
     }
 
     // ------------------------------------------------------------------ music extras: source name + lyric lines
-    fun music2(hasArt: Boolean, synced: Boolean, lyricState: Int, lineIdx: Int, src: String?, prev: String?, cur: String?, next: String?): ByteArray {
+    fun music2(hasArt: Boolean, synced: Boolean, lyricState: Int, lineIdx: Int, src: String?, prev: String?, cur: String?, next: String?, video: Boolean = false): ByteArray {
         fun s(t: String?, max: Int) = ascii(t, max).toByteArray(Charsets.US_ASCII)
         val a = s(src, M2_SRC); val p = s(prev, M2_PREV); val c = s(cur, M2_CUR); val n = s(next, M2_NEXT)
-        val flags = (if (hasArt) 1 else 0) or (if (synced) 2 else 0)
+        val flags = (if (hasArt) 1 else 0) or (if (synced) 2 else 0) or (if (video) 4 else 0)
         return frame(MSG_MUSIC2, byteArrayOf(flags.toByte(), lyricState.coerceIn(0, 6).toByte()) + le16(lineIdx.coerceIn(0, 65535)) +
             byteArrayOf(a.size.toByte()) + a + byteArrayOf(p.size.toByte()) + p + byteArrayOf(c.size.toByte()) + c + byteArrayOf(n.size.toByte()) + n)
     }
+
+    /**
+     * One chunk of the phone-rendered lyric mask (1 bit per pixel, MSB first, 224x80). [line] ties the mask to the MUSIC2 line
+     * index so a late chunk from the previous line can never be shown as the current one. Every chunk is sent in order; the frame
+     * fits one BLE write at the negotiated MTU.
+     */
+    fun lyricBand(token: Int, seq: Int, line: Int, data: ByteArray, off: Int, len: Int): ByteArray {
+        require(len in 1..LYR_CHUNK) { "bad lyric chunk" }
+        require(off >= 0 && off + len <= data.size) { "bad lyric range" }
+        val head = byteArrayOf((token and 0xFF).toByte(), (seq and 0xFF).toByte()) + le16(line) + le16(LYR_W) + le16(LYR_H)
+        return frame(MSG_LYRIC, head + data.copyOfRange(off, off + len))
+    }
+
+    /** Tells the display to drop the rendered lyric band (track ended, lyrics unavailable, video started). */
+    fun lyricClear(): ByteArray = frame(MSG_LYRIC, byteArrayOf(0, 0))
 
     // ------------------------------------------------------------------ image transfer (custom screen file, album art)
     fun crc32(data: ByteArray): Long { val c = java.util.zip.CRC32(); c.update(data, 0, data.size); return c.value }
@@ -168,17 +188,21 @@ object DeviceProtocol {
                  val timeValid: Boolean, val pairingOpen: Boolean, val hasWifi: Boolean, val stepsFresh: Boolean, val musicFresh: Boolean,
                  val bonds: Int, val heapKb: Int,
                  // transfer feedback (bytes 10..18); hasExt = false on firmware that predates the image transfer
-                 val hasExt: Boolean = false, val xferState: Int = 0, val xferId: Int = 0, val xferNext: Int = 0, val xferReason: Int = 0, val customCrc: Long = 0L)
+                 val hasExt: Boolean = false, val xferState: Int = 0, val xferId: Int = 0, val xferNext: Int = 0, val xferReason: Int = 0, val customCrc: Long = 0L,
+                 // bytes 19..22 on firmware that knows the art CRC: CRC-32 of the album art currently in the device's RAM (0 = none)
+                 val artCrc: Long = 0L)
 
     fun parseStatus(b: ByteArray?): Status? {
         if (b == null || b.size < STATUS_LEN) return null
         fun u(i: Int) = b[i].toInt() and 0xFF
         if (u(0) != PROTO) return null
         val f = u(6)
-        val ext = b.size >= STATUS_FULL_LEN
+        val ext = b.size >= STATUS_LEN + STATUS_EXT_LEGACY_LEN
+        val withArt = b.size >= STATUS_FULL_LEN
+        fun u32(i: Int) = u(i).toLong() or (u(i + 1).toLong() shl 8) or (u(i + 2).toLong() shl 16) or (u(i + 3).toLong() shl 24)
         return Status(u(0), u(1), u(2), u(3).coerceIn(0, SCREEN_LAST), u(4).coerceIn(0, 3), u(5), f and 1 != 0, f and 2 != 0, f and 4 != 0, f and 8 != 0, f and 16 != 0, u(7), u(8),
             ext, if (ext) u(10) else 0, if (ext) u(11) else 0, if (ext) u(12) or (u(13) shl 8) else 0, if (ext) u(14) else 0,
-            if (ext) (u(15).toLong() or (u(16).toLong() shl 8) or (u(17).toLong() shl 16) or (u(18).toLong() shl 24)) else 0L)
+            if (ext) u32(15) else 0L, if (withArt) u32(19) else 0L)
     }
 
     /** Messages for the reason codes the device reports (protocol.h XferReason). */

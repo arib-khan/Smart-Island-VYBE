@@ -55,19 +55,20 @@ static std::vector<uint16_t> sampleImage(uint16_t w, uint16_t h, std::vector<uin
 
 // ---- in-memory sink ----
 struct MemSink : RxSink {
-  Bytes stored, tmp, art; uint32_t crc = 0; bool open_ = false; bool failOpen = false; uint8_t openReason = XR_NO_SPACE; bool failWrite = false; int commits = 0, writes = 0, aborts = 0;
+  Bytes stored, tmp, art; uint32_t crc = 0, artCrc = 0; bool open_ = false; bool failOpen = false; uint8_t openReason = XR_NO_SPACE; bool failWrite = false; int commits = 0, writes = 0, aborts = 0;
   uint16_t W = 240, H = 320;
   uint32_t storedCustomCrc() override { return crc; }
+  uint32_t storedArtCrc() override { return artCrc; }
   bool open(uint8_t, uint32_t, uint16_t, uint16_t, uint8_t& reason) override { if (failOpen) { reason = openReason; return false; } tmp.clear(); open_ = true; return true; }
   bool write(uint8_t kind, const uint8_t* d, size_t n) override { if (failWrite) return false; writes++; tmp.insert(tmp.end(), d, d + n); (void)kind; return true; }
   bool commit(uint8_t kind, uint32_t c, uint8_t& reason) override {
     if (kind == KIND_CUSTOM) { if (!validate(tmp, W, H)) { reason = XR_BAD_IMAGE; tmp.clear(); return false; } stored = tmp; crc = c; commits++; }
-    else art = tmp;
+    else { art = tmp; artCrc = c; }
     tmp.clear(); open_ = false; return true;
   }
   void abort(uint8_t) override { tmp.clear(); open_ = false; aborts++; }
   void deleteCustom() override { stored.clear(); crc = 0; }
-  void clearArt() override { art.clear(); }
+  void clearArt() override { art.clear(); artCrc = 0; }
 };
 
 // ---- the phone's sender, mirroring CustomScreen.kt: window of 8 chunks, rewinds to the device's nextSeq after a stall ----
@@ -176,8 +177,8 @@ int main(int argc, char** argv) {
   { ImgBegin b; Bytes p(16, 0); p[0] = 3; p[1] = 0; wr32(&p[2], 5000); wr32(&p[6], 0xDEADBEEF); wr16(&p[10], 180); wr16(&p[12], 240); wr16(&p[14], 320);
     CHECK(parseImgBegin(p.data(), 16, b) && b.xfer == 3 && b.total == 5000 && b.crc == 0xDEADBEEF && b.chunk == 180 && b.w == 240 && b.h == 320, "image begin parses");
     CHECK(!parseImgBegin(p.data(), 15, b), "begin wrong length"); p[1] = 2; CHECK(!parseImgBegin(p.data(), 16, b), "begin unknown kind"); p[1] = 0; wr16(&p[10], 191); CHECK(!parseImgBegin(p.data(), 16, b), "begin chunk too big"); wr16(&p[10], 0); CHECK(!parseImgBegin(p.data(), 16, b), "begin zero chunk"); }
-  { XferStatus s; s.state = XFER_DONE; s.id = 9; s.nextSeq = 0x1234; s.reason = XR_CRC; s.customCrc = 0xA1B2C3D4; uint8_t o[STATUS_EXT_LEN]; encodeStatusExt(s, o);
-    const uint8_t want[] = {2, 9, 0x34, 0x12, 5, 0xD4, 0xC3, 0xB2, 0xA1}; CHECK(memcmp(o, want, sizeof want) == 0, "status extension bytes"); CHECK(STATUS_FULL_LEN == 19, "status is 19 bytes"); }
+  { XferStatus s; s.state = XFER_DONE; s.id = 9; s.nextSeq = 0x1234; s.reason = XR_CRC; s.customCrc = 0xA1B2C3D4; s.artCrc = 0x44332211; uint8_t o[STATUS_EXT_LEN]; encodeStatusExt(s, o);
+    const uint8_t want[] = {2, 9, 0x34, 0x12, 5, 0xD4, 0xC3, 0xB2, 0xA1, 0x11, 0x22, 0x33, 0x44}; CHECK(memcmp(o, want, sizeof want) == 0, "status extension bytes"); CHECK(STATUS_FULL_LEN == 23, "status is 23 bytes"); }
 
   // ------------------------------------------------------------------ receiver: clean link
   {

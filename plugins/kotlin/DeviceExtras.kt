@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Color
 import androidx.core.app.NotificationManagerCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -12,12 +11,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
- * Data sources for the new device screens: phone screen time, the notification queue, lyrics state, the media source name and album-art bytes.
- * Everything here reuses what the app already has (UsageUtil, MediaListener, Cfg). Settings live in their own preference file ("meowextras") because
- * "Forget device" wipes the device preferences, and these are the user's own choices.
+ * Data sources for the new device screens: phone screen time, the notification queue, lyrics state and album-art bytes.
+ * Everything here reuses what the app already has (UsageUtil, MediaListener, Cfg, Provider). Settings live in their own preference
+ * file ("meowextras") because "Forget device" wipes the device preferences, and these are the user's own choices.
  */
 object DeviceExtras {
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("meowextras", Context.MODE_PRIVATE)
@@ -121,82 +122,92 @@ object DeviceExtras {
     }
 
     // ================================================================== media source + album art
-    const val SPOTIFY = "com.spotify.music"
-    fun isSpotify(pkg: String) = pkg == SPOTIFY || pkg == "com.spotify.lite"
-    fun sourceLabel(ctx: Context, pkg: String): String = when {
-        isSpotify(pkg) -> "SPOTIFY"
-        pkg == "com.google.android.youtube" -> "YOUTUBE"
-        pkg == "com.google.android.apps.youtube.music" -> "YT MUSIC"
-        pkg.startsWith("com.brave.browser") -> "BRAVE"
-        pkg == "com.android.chrome" -> "CHROME"
-        pkg.isEmpty() -> ""
-        else -> DeviceProtocol.ascii(appName(ctx, pkg), 14).uppercase().ifEmpty { "MUSIC" }
-    }
+    const val ART = ArtCache.ART
+    fun isSpotify(pkg: String) = Provider.kind(pkg) == Provider.Kind.SPOTIFY
+    /** ASCII source pill name for any provider (SPOTIFY / AMAZON MUSIC / YOUTUBE / the app's own label). */
+    fun sourceLabel(ctx: Context, pkg: String): String = Provider.sourceLabel(pkg, if (pkg.isEmpty()) "" else appName(ctx, pkg))
 
-    const val ART = 80
-    /** The 96x96 artwork the media listener already decoded -> 80x80 RGB565 little-endian (12 800 bytes), the format the display expects. */
-    fun artBytes(src: Bitmap): ByteArray {
-        val s = Bitmap.createScaledBitmap(src, ART, ART, true)
-        val px = IntArray(ART * ART); s.getPixels(px, 0, ART, 0, 0, ART, ART)
-        if (s !== src) s.recycle()
-        val out = ByteArray(ART * ART * 2)
-        for (i in px.indices) {
-            val c = px[i]; val a = Color.alpha(c)
-            var r = Color.red(c); var g = Color.green(c); var b = Color.blue(c)
-            if (a < 255) { r = r * a / 255; g = g * a / 255; b = b * a / 255 }           // transparent artwork is shown over black
-            val v = ((r shr 3) shl 11) or ((g shr 2) shl 5) or (b shr 3)
-            out[2 * i] = v.toByte(); out[2 * i + 1] = (v shr 8).toByte()
-        }
-        return out
-    }
+    /** 80x80 RGB565 little-endian (12 800 bytes), the format the display expects. Encoding runs on ArtCache's background thread. */
+    fun artBytes(src: Bitmap): ByteArray = ArtCache.encode(src) ?: ByteArray(0)
 
     // ================================================================== lyrics
-    fun lyricsProvider(ctx: Context): String = prefs(ctx).getString("lyricsProvider", "off") ?: "off"
-    fun setLyricsProvider(ctx: Context, name: String) { prefs(ctx).edit().putString("lyricsProvider", if (name == "lrclib") "lrclib" else "off").apply(); Lyrics.reset() }
+    fun lyricsProvider(ctx: Context): String {
+        val v = prefs(ctx).getString("lyricsProvider", "off") ?: "off"
+        return if (v == "online" || v == "lrclib" || v == "on") "online" else "off"
+    }
+    fun setLyricsProvider(ctx: Context, name: String) {
+        val v = if (name == "online" || name == "lrclib" || name == "on") "online" else "off"
+        prefs(ctx).edit().putString("lyricsProvider", v).apply()
+        Lyrics.reset()
+    }
 
     /**
-     * Lyrics for the track Spotify is playing, from an opt-in provider only. State machine per track:
-     *   not Spotify -> NA (the display then says "Captions unavailable"); provider off -> PROVIDER_OFF; fetching -> LOADING;
-     *   synchronised lines -> AVAILABLE; text without timestamps -> UNSYNCED (never shown as if it were in time); none -> UNAVAILABLE; network error -> OFFLINE.
+     * Lyrics for whatever music app is playing (YouTube and video apps are excluded by [NowPlaying.lyricsEligible]). Opt-in: with
+     * the switch off nothing leaves the phone. State machine per track:
+     *   provider off -> PROVIDER_OFF; fetching -> LOADING; timestamped lines -> AVAILABLE; plain text only -> UNSYNCED
+     *   (shown without pretending it is in time); no source found -> UNAVAILABLE; network failure -> OFFLINE.
      */
     object Lyrics {
-        private val exec = Executors.newSingleThreadExecutor()
+        // One background lookup at a time. Only the newest song waits in the queue, so skipping tracks quickly cannot build a backlog
+        // of slow lookups; the running request is left to finish and its result is discarded by the key check below.
+        private val exec = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue<Runnable>(1), ThreadPoolExecutor.DiscardOldestPolicy())
+        private val service = LyricsService(listOf(LrcLibProvider(), LyricsOvhProvider()))
         @Volatile private var key = ""
         @Volatile var state = DeviceProtocol.LY_NA; private set
-        @Volatile private var lines: List<Lrc.Line> = emptyList()
+        @Volatile var detail = ""; private set                 // what the last lookup answered (shown in the app to diagnose problems)
+        @Volatile var providerName = ""; private set
+        @Volatile private var syncedLines: List<Lrc.Line> = emptyList()
+        @Volatile private var plainLines: List<String> = emptyList()
         @Volatile private var offlineAt = 0L
-        private val cache = object : LinkedHashMap<String, LyricsResult>(8, 0.75f, true) { override fun removeEldestEntry(e: MutableMap.MutableEntry<String, LyricsResult>?) = size > 8 }
+        private val cache = object : LinkedHashMap<String, LyricsResult>(16, 0.75f, true) { override fun removeEldestEntry(e: MutableMap.MutableEntry<String, LyricsResult>?) = size > 32 }
 
-        fun reset() { key = ""; state = DeviceProtocol.LY_NA; lines = emptyList() }
+        fun reset() { key = ""; state = DeviceProtocol.LY_NA; detail = ""; providerName = ""; syncedLines = emptyList(); plainLines = emptyList() }
+        fun hasBand(): Boolean = state == DeviceProtocol.LY_AVAILABLE || state == DeviceProtocol.LY_UNSYNCED
 
-        fun update(ctx: Context, spotify: Boolean, title: String, artist: String, durSec: Int) {
-            if (!spotify || title.isBlank()) { reset(); return }
-            val provider = lyricsProvider(ctx)
-            val k = "$provider|$title|$artist|$durSec"
+        fun update(ctx: Context, eligible: Boolean, title: String, artist: String, album: String, durationSec: Int) {
+            if (!eligible || title.isBlank()) { reset(); return }
+            if (lyricsProvider(ctx) != "online") {
+                key = ""; state = DeviceProtocol.LY_PROVIDER_OFF; detail = ""; providerName = ""; syncedLines = emptyList(); plainLines = emptyList(); return
+            }
+            val q = LyricsQuery(title, artist, album, durationSec)
+            val k = Provider.cacheKey("lyrics", "", title, artist, album) + "|" + durationSec
             val retryOffline = state == DeviceProtocol.LY_OFFLINE && System.currentTimeMillis() - offlineAt > 60_000L
             if (k == key && !retryOffline) return
-            key = k; lines = emptyList()
-            if (provider != "lrclib") { state = DeviceProtocol.LY_PROVIDER_OFF; return }
+            key = k; syncedLines = emptyList(); plainLines = emptyList(); providerName = ""
             val hit = synchronized(cache) { cache[k] }
-            if (hit != null) { state = hit.state; lines = hit.lines; return }
-            state = DeviceProtocol.LY_LOADING
-            val appCtx = ctx.applicationContext
+            if (hit != null) { apply(hit); return }
+            state = DeviceProtocol.LY_LOADING; detail = "looking up…"
             exec.execute {
-                val r = try { LrcLibProvider().fetch(title, artist, durSec) } catch (e: Exception) { LyricsResult(DeviceProtocol.LY_OFFLINE, emptyList()) }
+                val r = try { service.fetch(q) } catch (e: Exception) { LyricsResult(DeviceProtocol.LY_OFFLINE, detail = "error: " + e.javaClass.simpleName) }
                 if (key == k) {
-                    state = r.state; lines = r.lines
+                    apply(r)
                     if (r.state == DeviceProtocol.LY_OFFLINE) offlineAt = System.currentTimeMillis() else synchronized(cache) { cache[k] = r }
                     DeviceLink.requestSync()
                 }
             }
         }
 
+        private fun apply(r: LyricsResult) {
+            // lines first, state last: a reader that sees AVAILABLE also sees the lines (volatile write ordering)
+            syncedLines = r.synced; plainLines = r.plain; detail = r.detail; providerName = r.provider; state = r.state
+        }
+
         class Current(val idx: Int, val prev: String, val cur: String, val next: String)
+
         /** Only meaningful when [state] == AVAILABLE. Before the first timestamp the current line is empty and the first line is "next". */
         fun current(posMs: Long): Current {
-            val l = lines; val i = Lrc.indexAt(l, posMs)
+            val l = syncedLines; val i = Lrc.indexAt(l, posMs)
             return if (i < 0) Current(-1, "", "", l.firstOrNull { it.text.isNotBlank() }?.text ?: "")
             else Current(i, Lrc.neighbour(l, i, -1), l[i].text, Lrc.neighbour(l, i, 1))
+        }
+
+        /**
+         * A moving three-line window over plain lyrics. The lines have no timestamps, so this is reading pagination (one line every
+         * six seconds of playback), never presented as synchronised; the display keeps the UNSYNCED state.
+         */
+        fun plainCurrent(posMs: Long): Current {
+            val w = PlainPager.at(plainLines, posMs)
+            return Current(w.idx, w.prev, w.cur, w.next)
         }
     }
 }

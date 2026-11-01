@@ -1,14 +1,18 @@
 // Screen C (redesigned): a clean music player for the 240x320 TFT. No cat animation any more.
-//   header pill with the media source (SPOTIFY / YOUTUBE / ...) and a play / pause glyph
+//   header pill with the media source (SPOTIFY / AMAZON MUSIC / YOUTUBE / ...) and a play / pause glyph
 //   album artwork (80x80, sent by the phone) or a neutral placeholder tile
 //   title (long titles scroll), artist, progress bar with elapsed / total time
-//   lyric zone: Spotify lines only when the phone got time-synchronised lyrics from a real source; otherwise a plain, honest status line.
-//   Other apps (YouTube, Brave, ...): "Captions unavailable" - Android does not give us their captions, and nothing is ever made up.
+//   lyric zone: lines from a legitimate lyrics source, rendered on the phone into a 1-bit mask so every script and right-to-left
+//   text works (the TFT's own fonts are ASCII only). Plain lyrics are shown without claiming they are in time. A song with no
+//   lyrics gets a short, honest status line.
+//   Video sources (YouTube, streaming video): NO lyrics and NO captions. Only thumbnail, title, duration, progress and a progress
+//   bar at the bottom of the screen. Android gives apps no access to another app's subtitles and Meow Island no longer tries.
 // No playback buttons: the TFT has no touch input, the screen reflects what the phone plays (controls stay on the phone).
 #pragma once
 #include "gfx_common.h"
 #include "protocol.h"
 #include "custom_store.h"      // artBuf / artReady / artRev
+#include "lyric_band.h"        // lyrBuf / lyrReady / lyrRev (phone-rendered lyric mask)
 
 struct MusicView {
   meow::MusicData d;
@@ -30,6 +34,11 @@ static bool ieq(const char* a, const char* b) { for (; *a && *b; a++, b++) { cha
 static bool musicPlaying(const MusicView& v) { return v.linked && v.haveData && v.d.session && v.d.playing; }
 static bool musicHasSession(const MusicView& v) { return v.linked && v.haveData && v.d.session; }
 static bool isSpotify(const MusicView& v) { return v.haveData2 && ieq(v.d2.src, "SPOTIFY"); }
+/** Video sources show only the thumbnail, title, duration, progress and the bottom progress bar: no lyric/caption zone. */
+static bool musicVideo(const MusicView& v) {
+  if (v.haveData2 && v.d2.video) return true;
+  return v.haveData2 && (ieq(v.d2.src, "YOUTUBE") || ieq(v.d2.src, "YT MUSIC"));   // firmware also understands a phone that only sends the source
+}
 
 static int musicPillId(const MusicView& v) { return !v.linked ? 2 : (v.haveData2 && v.d2.src[0] && musicHasSession(v)) ? 1 : 0; }
 static void musicDrawPill(const MusicView& v) {
@@ -41,7 +50,7 @@ static void musicDrawIcon(int state) {
   G = &tft; Y0 = 0;
   tft.fillRect(0, 8, 26, 30, C_BG);
   if (state == 2) { tft.fillRect(7, 15, 4, 16, C_LINE_HI); tft.fillRect(14, 15, 4, 16, C_LINE_HI); }
-  else if (state == 1) tft.fillTriangle(8, 15, 8, 31, 19, 23, C_DIM);
+  else if (state == 1) { tft.fillTriangle(8, 15, 8, 31, 19, 23, C_DIM); }
 }
 
 static void fmtTime(char* out, size_t cap, uint32_t s) {
@@ -74,7 +83,7 @@ static void musicDrawArt(const MusicView& v) {
   }
 }
 
-// ----- word wrap for the lyric lines (at most maxLines lines; the last one is shortened with "..." if the text is longer) -----
+// ----- word wrap for the ASCII fallback of the lyric lines (at most maxLines lines) -----
 static int wrapLines(const char* s, const GFXfont* f, int maxW, char out[][64], int maxLines) {
   int n = 0; char cur[64] = ""; char word[64];
   const char* p = s;
@@ -93,34 +102,63 @@ static int wrapLines(const char* s, const GFXfont* f, int maxW, char out[][64], 
 }
 
 static void drawLyricZone(const MusicView& v) {
-  if (!musicHasSession(v)) return;
+  if (!musicHasSession(v) || musicVideo(v)) return;      // video: no lyrics / captions at all
   const meow::Music2Data& m = v.d2;
+  const bool hasText = m.lyricState == 2 || m.lyricState == 6;
+
+  if (hasText && lyrValid(m.lineIdx)) {                  // phone-rendered mask: any script, RTL included
+    lyrDraw();
+    return;
+  }
+  if (hasText && m.cur[0]) {                             // ASCII fallback (old phone app / mask in flight)
+    char fit[64];
+    if (m.prev[0]) { fitText(fit, sizeof fit, m.prev, &FreeSans9pt7b, 224); gText(120, 246, fit, &FreeSans9pt7b, C_MUTE, 1); }
+    char ln[2][64]; int n = wrapLines(m.cur, &FreeSansBold9pt7b, 224, ln, 2);
+    for (int i = 0; i < n; i++) gText(120, 270 + i * 22, ln[i], &FreeSansBold9pt7b, C_TEXT, 1);
+    if (m.next[0]) { fitText(fit, sizeof fit, m.next, &FreeSans9pt7b, 224); gText(120, n == 2 ? 314 : 296, fit, &FreeSans9pt7b, C_MUTE, 1); }
+    return;
+  }
+
   const char* l1 = nullptr; const char* l2 = nullptr;
-  if (isSpotify(v)) {
-    switch (m.lyricState) {
-      case 2: {
-        char fit[64];
-        if (m.prev[0]) { fitText(fit, sizeof fit, m.prev, &FreeSans9pt7b, 224); gText(120, 246, fit, &FreeSans9pt7b, C_MUTE, 1); }
-        char ln[2][64]; int n = wrapLines(m.cur, &FreeSansBold9pt7b, 224, ln, 2);
-        for (int i = 0; i < n; i++) gText(120, 270 + i * 22, ln[i], &FreeSansBold9pt7b, C_TEXT, 1);
-        if (m.next[0]) { fitText(fit, sizeof fit, m.next, &FreeSans9pt7b, 224); gText(120, n == 2 ? 314 : 296, fit, &FreeSans9pt7b, C_MUTE, 1); }
-        return;
-      }
-      case 1: l1 = "Loading lyrics..."; break;
-      case 3: l1 = "Lyrics unavailable"; l2 = "for this track"; break;
-      case 4: l1 = "Lyrics are off"; l2 = "Enable in the Meow Island app"; break;
-      case 5: l1 = "Lyrics need internet"; l2 = "on the phone"; break;
-      case 6: l1 = "Synced lyrics unavailable"; l2 = "for this track"; break;
-      default: return;                                              // nothing received yet: show nothing rather than guess
-    }
-  } else { l1 = "Captions unavailable"; l2 = "Android does not share them"; }
+  switch (m.lyricState) {
+    case 1: l1 = "Loading lyrics..."; break;
+    case 3: l1 = "No lyrics found"; l2 = "for this track"; break;
+    case 4: l1 = "Lyrics are off"; l2 = "Enable in the Meow Island app"; break;
+    case 5: l1 = "Lyrics need internet"; l2 = "on the phone"; break;
+    case 6: l1 = "Plain lyrics only"; l2 = "Shown without timing"; break;
+    default: return;                                     // nothing received yet: show nothing rather than guess
+  }
   gText(120, 272, l1, &FreeSans9pt7b, C_DIM, 1);
   if (l2) gText(120, 294, l2, &FreeSans9pt7b, C_MUTE, 1);
+}
+
+/** Video sources: progress and times at the bottom of the screen, where the lyric zone used to be. */
+static void drawBottomProgress(const MusicView& v, uint32_t now) {
+  const bool show = v.haveData && v.d.session;
+  const bool hasLen = show && v.d.durSec > 0;
+  const uint32_t pos = hasLen ? musicPosSec(v, now) : 0;
+  const int bx = 14, bw = 212, cy = 302, r = 7;
+  gRRect(bx + r, cy - 3, bw - 2 * r, 6, 3, C_TRACK);
+  if (hasLen) {
+    const int fx = bx + r + (bw - 2 * r) * (int)pos / (int)v.d.durSec;
+    if (fx > bx + r + 1) for (int x = bx + r; x < fx; x++) {
+      int t = (x - bx) * 255 / bw;
+      gRect(x, cy - 3, 1, 6, RGB(lerp8(124, 208, t, 255), lerp8(77, 112, t, 255), lerp8(255, 242, t, 255)));
+    }
+    gCircle(fx, cy, r, C_RING); gCircle(fx, cy, r - 2, C_TEXT);
+  } else {
+    gCircle(bx + r, cy, r, C_RING); gCircle(bx + r, cy, r - 2, C_TEXT);
+  }
+  char a[12], b[12];
+  fmtTime(a, sizeof a, pos); if (hasLen) fmtTime(b, sizeof b, v.d.durSec); else strcpy(b, "--:--");
+  gText(bx, 286, a, &FreeSans9pt7b, C_TIME, 0);
+  gText(bx + bw, 286, b, &FreeSans9pt7b, C_TIME, 2);
 }
 
 static void drawMusicBand(const MusicView& v, uint32_t now) {
   const meow::MusicData& d = v.d;
   const bool show = v.haveData && d.session;
+  const bool video = musicVideo(v);
   const char* title = show && d.title[0] ? d.title : (show ? "Playing" : (v.linked ? "Nothing playing" : "Phone not connected"));
   const char* artist = show ? d.artist : "";
 
@@ -137,6 +175,11 @@ static void drawMusicBand(const MusicView& v, uint32_t now) {
   }
   char fit[64];
   if (artist[0]) { fitText(fit, sizeof fit, artist, &FreeSans9pt7b, 224); gText(120, MUS_Y + 46, fit, &FreeSans9pt7b, C_ARTIST, 1); }
+
+  if (video) {                       // only the bottom bar; band A clips this away, band B shows it
+    drawBottomProgress(v, now);
+    return;
+  }
 
   // progress bar (212 px wide, the thumb never leaves it)
   const int bx = 14, bw = 212, cy = MUS_Y + 64, r = 7;
@@ -158,10 +201,12 @@ static void drawMusicBand(const MusicView& v, uint32_t now) {
   drawLyricZone(v);
 }
 
-// Everything that decides what the lyric zone looks like; when it changes band B is redrawn.
-static uint32_t musicLyricSig(const MusicView& v) {
+// Everything that decides what the lyric zone / bottom bar looks like; when it changes band B is redrawn.
+static uint32_t musicLyricSig(const MusicView& v, uint32_t now) {
   uint32_t h = 2166136261u; auto mix = [&](uint32_t x) { h ^= x; h *= 16777619u; };
-  mix(musicHasSession(v)); mix(isSpotify(v)); mix(v.d2.lyricState); mix(v.d2.lineIdx); mix(v.haveData2);
+  mix(musicHasSession(v)); mix(musicVideo(v)); mix(v.d2.lyricState); mix(v.d2.lineIdx); mix(v.haveData2);
+  mix(lyrReady); mix(lyrRev); mix(lyrLine);
+  if (musicVideo(v)) mix(musicPosSec(v, now));           // the bottom bar moves once a second without a full lyric transfer
   const char* parts[4] = {v.d2.prev, v.d2.cur, v.d2.next, v.d2.src};
   for (int i = 0; i < 4; i++) for (const char* s = parts[i]; *s; s++) mix((uint8_t)*s);
   return h;
@@ -172,11 +217,13 @@ static void musicEnter(const MusicView& v, uint32_t now) {
   G = &tft; Y0 = 0;
   tft.fillScreen(C_BG);
   musUi.pill = musicPillId(v); musicDrawPill(v);
-  musUi.icon = -1; musUi.artRevShown = 0xFFFFFFFF; musUi.artMode = -1; musUi.sig = 0; musUi.bandBDirty = true;
+  musUi.icon = -1; musUi.artRevShown = artRev; musUi.artMode = (musicHasSession(v) && v.haveData2 && v.d2.hasArt && artReady) ? 1 : 0;
+  musicDrawArt(v);                       // placeholder or the current cover immediately, never a blank tile
+  musUi.sig = 0; musUi.bandBDirty = true;
   musUi.marqueeStart = now; strncpy(musUi.title, v.d.title, sizeof musUi.title - 1); musUi.title[sizeof musUi.title - 1] = 0;
 }
 
-// Called every loop: redraws only what changed. Band A ~10 fps (title scroll + progress); band B (lyrics) only when its content changed.
+// Called every loop: redraws only what changed. Band A ~10 fps (title scroll + progress); band B (lyrics / video bar) only when its content changed.
 static void musicTick(const MusicView& v, uint32_t now) {
   static uint32_t lastBand = 0;
   G = &tft; Y0 = 0;
@@ -189,14 +236,14 @@ static void musicTick(const MusicView& v, uint32_t now) {
   if (icon != musUi.icon) { musUi.icon = icon; musicDrawIcon(icon); }
   int artMode = (musicHasSession(v) && v.haveData2 && v.d2.hasArt && artReady) ? 1 : 0;
   if (artMode != musUi.artMode || (artMode && musUi.artRevShown != artRev)) { musUi.artMode = artMode; musUi.artRevShown = artRev; musicDrawArt(v); }
-  uint32_t sig = musicLyricSig(v); if (sig != musUi.sig) { musUi.sig = sig; musUi.bandBDirty = true; }
+  uint32_t sig = musicLyricSig(v, now); if (sig != musUi.sig) { musUi.sig = sig; musUi.bandBDirty = true; }
 
   if (now - lastBand >= 100) {
     lastBand = now;
     if (canvas) {
       G = canvas; Y0 = MUS_Y; canvas->fillScreen(C_BG); drawMusicBand(v, now);
       G = &tft; Y0 = 0; pushCanvas(MUS_Y);
-      if (musUi.bandBDirty) {                                    // lower part of the lyric zone
+      if (musUi.bandBDirty) {                                    // lower part of the lyric zone / video progress bar
         musUi.bandBDirty = false;
         G = canvas; Y0 = MUS_BANDB_Y; canvas->fillScreen(C_BG); drawMusicBand(v, now);
         G = &tft; Y0 = 0; tft.drawRGBBitmap(0, MUS_BANDB_Y, canvas->getBuffer(), CANVAS_W, MUS_BANDB_ROWS);

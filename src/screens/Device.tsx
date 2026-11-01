@@ -112,7 +112,7 @@ export default function Device({ back, openCustom }: { back: () => void; openCus
           <Sub>{SCREENS[d.screen].hint}</Sub>
           <View style={{ marginTop: 8, alignSelf: 'flex-start' }}><Btn small kind="ghost" title="Sync now" disabled={!d.ready || busy === 'sync'} onPress={() => act('sync', () => dev.syncNow())} /></View>
           <Sub>{d.ready ? (d.stepsFresh ? 'Steps are up to date. ' : 'Steps are not on the display yet: turn on the Step counter in the Health tab. ') + (d.musicFresh ? 'Music is syncing.' : '') : ''}</Sub>
-          <Sub>The display shows what Meow Island already knows: steps from the Health tab, what is playing (needs Notification access, as for the music widget), phone screen time (needs Usage Access) and, if you switch it on below, your newest notifications. Text in non-Latin scripts cannot be drawn by the display and is simplified or left out.</Sub>
+          <Sub>The display shows what Meow Island already knows: steps from the Health tab, what is playing (needs Notification access, as for the music widget), phone screen time (needs Usage Access) and, if you switch it on below, your newest notifications. Titles and notifications in non-Latin scripts are simplified on the display, but lyrics are rendered on the phone, so Hindi, Urdu, Arabic, Korean, Japanese and other scripts are shown correctly.</Sub>
         </Card>
       )}
 

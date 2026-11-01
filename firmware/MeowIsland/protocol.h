@@ -3,7 +3,7 @@
 // sides against each other. All integers are little-endian.
 //
 //   frame   = 0xA5 | type | len | payload[len]            (len <= 200; any number of frames may be split across / packed into BLE writes)
-//   status  = 10 fixed bytes + 9 transfer bytes, read / notify (device -> phone), see encodeStatus() / encodeStatusExt()
+//   status  = 10 fixed bytes + 13 transfer bytes, read / notify (device -> phone), see encodeStatus() / encodeStatusExt()
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -33,8 +33,9 @@ enum MsgType : uint8_t {
   MSG_IMG_DATA = 0x0D,    // [xfer u8][seq u16][bytes]
   MSG_IMG_END = 0x0E,     // [xfer u8]
   MSG_IMG_CTRL = 0x0F,    // [op u8: 1 abort transfer, 2 delete custom image, 3 clear album art]
+  MSG_LYRIC = 0x10,       // see LyricChunk     (queued chunks of the phone-rendered lyric mask)
 };
-constexpr uint8_t MSG_LAST = 0x0F;
+constexpr uint8_t MSG_LAST = 0x10;
 
 enum Screen : uint8_t { SCREEN_CLOCK = 0, SCREEN_STEPS = 1, SCREEN_MUSIC = 2, SCREEN_SCREENTIME = 3, SCREEN_NOTIFS = 4, SCREEN_CUSTOM = 5, SCREEN_COUNT = 6 };
 enum WifiState : uint8_t { WIFI_NONE = 0, WIFI_CONNECTING = 1, WIFI_CONNECTED = 2, WIFI_FAILED = 3 };
@@ -248,17 +249,20 @@ inline bool parseNotifs(const uint8_t* p, uint8_t n, NotifData& o) {
 
 // ---- MUSIC2: extras for the music screen: where the sound comes from, and lyric lines when a legitimate source provided them ----
 // [flags u8][lyricState u8][lineIdx u16][srcLen u8][src][prevLen u8][prev][curLen u8][cur][nextLen u8][next]
-// flags: bit0 album art on the display belongs to this track, bit1 lyrics are time-synchronised
-// lyricState: 0 not applicable, 1 loading, 2 available (synchronised lines), 3 unavailable for this track, 4 lyrics provider off, 5 offline / error,
-//             6 the source only has plain text that is NOT time-synchronised (never shown as if it were synced)
+// flags: bit0 album art on the display belongs to this track, bit1 lyrics are time-synchronised, bit2 this is a video (no lyrics zone;
+//        the screen shows thumbnail, title, duration and a progress bar at the bottom)
+// lyricState: 0 not applicable, 1 loading, 2 available (synchronised lines), 3 unavailable for this track, 4 lyrics provider off,
+//             5 offline / error, 6 plain lyrics only (shown WITHOUT timing; the phone paginates them)
+// The phone also sends a rendered 1-bit mask (MSG_LYRIC) of the three lines so every script and right-to-left text renders on the
+// ASCII-only TFT. When that mask is not present the ASCII fields below are used as the fallback.
 constexpr uint8_t M2_SRC = 14, M2_PREV = 40, M2_CUR = 56, M2_NEXT = 40;
 struct Music2Data {
-  bool hasArt = false, synced = false; uint8_t lyricState = 0; uint16_t lineIdx = 0;
+  bool hasArt = false, synced = false, video = false; uint8_t lyricState = 0; uint16_t lineIdx = 0;
   char src[M2_SRC + 1] = ""; char prev[M2_PREV + 1] = ""; char cur[M2_CUR + 1] = ""; char next[M2_NEXT + 1] = "";
 };
 inline bool parseMusic2(const uint8_t* p, uint8_t n, Music2Data& o) {
   if (n < 8) return false;
-  Music2Data d; d.hasArt = p[0] & 1; d.synced = p[0] & 2; d.lyricState = p[1] > 6 ? 0 : p[1]; d.lineIdx = rd16(p + 2);
+  Music2Data d; d.hasArt = p[0] & 1; d.synced = p[0] & 2; d.video = p[0] & 4; d.lyricState = p[1] > 6 ? 0 : p[1]; d.lineIdx = rd16(p + 2);
   size_t at = 4;
   struct F { char* dst; size_t cap; uint8_t max; } fields[4] = {{d.src, sizeof d.src, M2_SRC}, {d.prev, sizeof d.prev, M2_PREV}, {d.cur, sizeof d.cur, M2_CUR}, {d.next, sizeof d.next, M2_NEXT}};
   for (auto& f : fields) {
@@ -269,6 +273,26 @@ inline bool parseMusic2(const uint8_t* p, uint8_t n, Music2Data& o) {
   if (at != n) return false;
   o = d; return true;
 }
+
+// ---- LYRIC: the three lyric lines rendered on the phone into a 1-bit mask (Devanagari, Arabic/Urdu RTL, Korean, Japanese, ...).
+// The TFT's fonts are ASCII only; Android does the shaping and font fallback, so the device just blits the mask in the lyric zone.
+// [token u8][seq u8][line u16][w u16][h u16][mask bytes]   (8-byte header, at most 190 bytes per frame)
+// w/h are 224x80. `line` must equal MUSIC2's lineIdx for the mask to be shown, so a late chunk can never show the previous line.
+// A 2-byte payload (0,0) clears the mask.
+constexpr uint16_t LYR_W = 224, LYR_H = 80;
+constexpr uint8_t LYR_ROW = LYR_W / 8, LYR_CHUNK = 190;
+constexpr uint16_t LYR_BYTES = LYR_ROW * LYR_H;
+struct LyricChunk { uint8_t token = 0, seq = 0; uint16_t line = 0, w = 0, h = 0; const uint8_t* data = nullptr; uint8_t len = 0; };
+inline bool parseLyricChunk(const uint8_t* p, uint8_t n, LyricChunk& o) {
+  if (n < 8) return false;
+  o.token = p[0]; o.seq = p[1]; o.line = rd16(p + 2); o.w = rd16(p + 4); o.h = rd16(p + 6);
+  o.data = p + 8; o.len = (uint8_t)(n - 8);
+  if (o.w != LYR_W || o.h != LYR_H || o.len == 0) return false;
+  const uint32_t off = (uint32_t)o.seq * LYR_CHUNK;
+  if (off + o.len > LYR_BYTES) return false;
+  return true;
+}
+inline bool isLyricClear(const uint8_t* p, uint8_t n) { return n == 2 && p[0] == 0 && p[1] == 0; }
 
 // ---- image transfer (custom HTML screen and album art) ----
 // BEGIN: [xfer u8][kind u8: 0 custom screen file, 1 album art raw RGB565][total u32][crc32 u32][chunk u16][w u16][h u16]   (16 bytes)
@@ -290,11 +314,13 @@ inline bool parseImgBegin(const uint8_t* p, uint8_t n, ImgBegin& o) {
 enum XferState : uint8_t { XFER_IDLE = 0, XFER_RECEIVING = 1, XFER_DONE = 2, XFER_FAILED = 3 };
 enum XferReason : uint8_t { XR_NONE = 0, XR_BAD_HEADER = 1, XR_TOO_LARGE = 2, XR_NO_SPACE = 3, XR_FLASH = 4, XR_CRC = 5, XR_SEQUENCE = 6, XR_BAD_IMAGE = 7, XR_NO_MEMORY = 8, XR_BUSY = 9 };
 
-// Status extension, appended after the 10 status bytes: [state u8][xfer u8][nextSeq u16][reason u8][customCrc u32]
-constexpr uint8_t STATUS_EXT_LEN = 9, STATUS_FULL_LEN = STATUS_LEN + STATUS_EXT_LEN;
-struct XferStatus { uint8_t state = XFER_IDLE, id = 0, reason = XR_NONE; uint16_t nextSeq = 0; uint32_t customCrc = 0; };
+// Status extension, appended after the 10 status bytes: [state u8][xfer u8][nextSeq u16][reason u8][customCrc u32][artCrc u32]
+// artCrc is the CRC-32 of the album art currently held in RAM (0 = none). Firmware before the art CRC sends 19 bytes; the phone
+// treats a short status as "unknown", so both directions stay compatible.
+constexpr uint8_t STATUS_EXT_LEN = 13, STATUS_FULL_LEN = STATUS_LEN + STATUS_EXT_LEN;
+struct XferStatus { uint8_t state = XFER_IDLE, id = 0, reason = XR_NONE; uint16_t nextSeq = 0; uint32_t customCrc = 0, artCrc = 0; };
 inline void encodeStatusExt(const XferStatus& x, uint8_t* o) {   // writes STATUS_EXT_LEN bytes at o (pass status + STATUS_LEN)
-  o[0] = x.state; o[1] = x.id; wr16(o + 2, x.nextSeq); o[4] = x.reason; wr32(o + 5, x.customCrc);
+  o[0] = x.state; o[1] = x.id; wr16(o + 2, x.nextSeq); o[4] = x.reason; wr32(o + 5, x.customCrc); wr32(o + 9, x.artCrc);
 }
 
 }  // namespace meow
